@@ -1,7 +1,7 @@
 # pi-agent-extensions
 
 A collection of [pi coding agent](https://github.com/earendil-works/pi) packages by korioinc.
-This repository uses npm workspaces and releases all packages under one versioned Git tag.
+This repository uses npm workspaces. Each package has its own version and Git release tags.
 The repository root is marked `private: true` and is never published to npm.
 
 ## Packages
@@ -65,13 +65,14 @@ npm run lint:fix   # Apply automatic lint fixes
 ```
 
 Pi loads TypeScript source directly, so no separate build output is needed.
-`npm run check` checks version alignment, formatting, linting, and types, then runs the release validation tests.
+`npm run check` checks formatting, linting, and types, then runs the release validation and package tests.
 `npm run pack:check` previews the files included in each package without uploading anything to npm.
+`npm run check:release -- <package-name>-<version>` validates a release tag against its workspace manifest.
 
 ## Adding a package
 
 1. Create `packages/pi-name` with `index.ts`, `package.json`, `tsconfig.json`, `README.md`, and `LICENSE`. Extend `../../tsconfig.json` from the package's TypeScript configuration. Use an existing package's configuration as a reference.
-2. Update `name`, `description`, and `repository.directory` in the new `package.json`; use `packages/pi-name` for the repository directory. Keep its version aligned with the root package.
+2. Update `name`, `description`, and `repository.directory` in the new `package.json`; use `packages/pi-name` for the repository directory. Choose its initial version independently of the root and other packages.
 3. Add `packages/pi-name` to `workspaces` in the root `package.json`. List paths explicitly; do not use globs.
 4. Add `./packages/pi-name/index.ts` to the root `pi.extensions` list. Pi uses this list when loading the entire repository as a package.
 5. Update the code and README.
@@ -87,9 +88,22 @@ See the [pi package documentation](https://github.com/earendil-works/pi/blob/mai
 ## GitHub Actions
 
 - `ci.yml`: Installs dependencies and runs all checks, including packaging checks, on pull requests and pushes to `main`.
-- `publish.yml`: On `v*` tag pushes, checks that all package versions match the tag and publishes public npm packages after validation passes.
+- `publish.yml`: On `pi-*-*` tag pushes, resolves exactly one workspace from the package name and version, checks the repository, then packs and publishes only that package.
 
 Pushing code to `main` alone does not publish packages.
+Tags use `<unscoped-package-name>-<version>`, without a `v` before the version. The version must match that package's `package.json` in the tagged commit. The root and other workspace versions do not need to match.
+
+For example, the initial package tags are:
+
+| Package                      | Tag                      |
+| ---------------------------- | ------------------------ |
+| `@korioinc/pi-service-tier`  | `pi-service-tier-0.1.0`  |
+| `@korioinc/pi-skill`         | `pi-skill-0.1.0`         |
+| `@korioinc/pi-model-catalog` | `pi-model-catalog-0.1.0` |
+| `@korioinc/pi-subagents`     | `pi-subagents-0.1.0`     |
+
+Unknown packages, mismatched versions, ambiguous tags and private packages fail validation before dependencies are installed or publishing starts. Old `v0.1.0` and `pi-subagents-v0.1.0` tags are not supported. GitHub Releases are optional and are not created by this workflow.
+
 Files published to npm are public even when this GitHub repository is private.
 Review each package's `files` list and the output of `npm run pack:check` before publishing.
 
@@ -100,8 +114,11 @@ Review each package's `files` list and the output of `npm run pack:check` before
 3. Add the token as a repository secret named `NPM_TOKEN` under **Settings → Secrets and variables → Actions** on GitHub.
 4. Merge this configuration and `package-lock.json` into `main`.
 5. Confirm that CI passes.
-6. Create the first release tag with `git tag v0.1.0`.
-7. Publish the release by pushing the tag with `git push origin v0.1.0`.
+6. Validate the selected package tag, for example `npm run check:release -- pi-subagents-0.1.0`.
+7. Create its first release tag with `git tag pi-subagents-0.1.0`.
+8. Publish only that package by pushing the tag with `git push origin pi-subagents-0.1.0`.
+
+Repeat with each package's own tag when it is ready for its first release. The first successful publish creates that npm package; no package page needs to be created in advance.
 
 Only the publish step in `publish.yml` uses the token. Replace the secret when the token expires.
 Provenance attestations are disabled because this GitHub repository is private.
@@ -109,22 +126,28 @@ After the first release, you can configure [npm trusted publishing](https://docs
 
 ### Subsequent releases
 
-Bump the root and all workspace versions together:
+Bump only the package being released. For example, to move `pi-subagents` from `0.1.0` to `0.1.1`, run these commands from the repository root:
 
 ```sh
-npm version patch --workspaces --include-workspace-root --no-git-tag-version
+npm version patch --workspace @korioinc/pi-subagents --no-git-tag-version
+npm run check:release -- pi-subagents-0.1.1
 npm run check
-npm run pack:check
+npm pack --dry-run --workspace @korioinc/pi-subagents
 ```
 
-Commit the updated manifests and lockfile, then merge them into `main`.
-Once CI passes, tag that commit with `v<version>`, matching the version in the root `package.json`.
-Push the tag to publish the release.
-For version `0.1.1`, use `git tag v0.1.1`, followed by `git push origin v0.1.1`.
+Commit the updated package manifest and lockfile, then merge them into `main`. Keep the root and unrelated package versions unchanged.
+Once CI passes, tag that commit and push the package tag:
+
+```sh
+git tag pi-subagents-0.1.1
+git push origin pi-subagents-0.1.1
+```
+
+This publishes only `@korioinc/pi-subagents@0.1.1`. Other packages keep their existing npm versions. Use each package's own name and version for its next release.
 
 Published versions cannot be overwritten.
-If publishing fails, first check which versions are already available, for example with `npm view @korioinc/pi-service-tier@0.1.0 version`.
-If only some packages were published, use the same tagged code to publish each remaining package with `npm publish --workspace @korioinc/package-name --access public`.
-Rerunning the workflow does not automatically skip packages that are already published.
+If publishing fails, first check whether the selected version is already available, for example with `npm view @korioinc/pi-subagents@0.1.1 version`.
+If it is absent, fix the publishing configuration and rerun the failed workflow for the same tag. If code changes are needed, commit them and use a new version and tag.
+Rerunning the workflow does not skip an already-published version.
 
 Released under the MIT License.

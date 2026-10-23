@@ -49,7 +49,7 @@ npm run pack:check
 
 Tests use the `node:test` runner. They cover the real pi extension loader, input parsing, autocomplete, queued messages, and rendering regressions.
 
-Follow the shared version and tag release process in the root [README](../../README.md). This package's initial version is `0.1.0`.
+Follow the independent package release process in the root [README](../../README.md). This package's initial version is `0.1.0`, with the tag `pi-skill-0.1.0`.
 
 ## Changes
 
