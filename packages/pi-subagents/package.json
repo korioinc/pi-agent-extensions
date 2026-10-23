@@ -1,0 +1,51 @@
+{
+  "name": "@korioinc/pi-subagents",
+  "version": "0.1.0",
+  "description": "Markdown-configured subagents for Pi with parent model authentication and tool delegation",
+  "keywords": [
+    "pi",
+    "pi-package",
+    "subagents"
+  ],
+  "license": "MIT",
+  "author": "korioinc",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/korioinc/pi-agent-extensions.git",
+    "directory": "packages/pi-subagents"
+  },
+  "files": [
+    "index.ts",
+    "src",
+    "examples",
+    "GLOSSARY.md",
+    "architecture.html",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.4.0 <2.0.0",
+    "@earendil-works/pi-coding-agent": ">=1.4.0 <2.0.0",
+    "@earendil-works/pi-mcp": ">=1.4.0 <2.0.0",
+    "@earendil-works/pi-tui": ">=1.4.0 <2.0.0",
+    "typebox": ">=1.3.27 <2.0.0"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

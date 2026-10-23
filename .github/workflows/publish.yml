@@ -1,0 +1,51 @@
+name: Publish Packages
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check release versions
+        run: npm run check:versions -- "${GITHUB_REF_NAME#v}"
+
+      - name: Check packages
+        run: npm run check
+
+      - name: Check package contents
+        run: npm run pack:check
+
+      - name: Publish packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # npm provenance requires a public source repository.
+          NPM_CONFIG_PROVENANCE: "false"
+        run: |
+          : "${NODE_AUTH_TOKEN:?Set the NPM_TOKEN repository secret before publishing}"
+          npm publish --workspaces --access public

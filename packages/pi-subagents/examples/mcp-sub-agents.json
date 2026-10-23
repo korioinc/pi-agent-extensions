@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "figma-bridge": {
+      "command": "/absolute/path/to/your-mcp-server",
+      "args": [],
+      "timeout": 30,
+      "exposure": "codemode"
+    }
+  }
+}

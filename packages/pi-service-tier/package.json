@@ -1,0 +1,46 @@
+{
+  "name": "@korioinc/pi-service-tier",
+  "version": "0.1.0",
+  "description": "Independent Fast and Ultrafast toggles for pi, including custom provider model IDs",
+  "keywords": [
+    "fast",
+    "pi",
+    "pi-package",
+    "service-tier",
+    "ultrafast"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/korioinc/pi-agent-extensions.git",
+    "directory": "packages/pi-service-tier"
+  },
+  "files": [
+    "index.ts",
+    "service-tier.ts",
+    "settings.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.4.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

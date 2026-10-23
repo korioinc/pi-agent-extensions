@@ -1,0 +1,12 @@
+**/.idea
+.DS_Store
+
+node_modules/
+*.tgz
+coverage/
+.env
+.env.*
+!.env.example
+
+/packages/pi-subagents/ARCHITECTURE.md
+/packages/pi-subagents/CODEX_SUBAGENT_METHODS.md

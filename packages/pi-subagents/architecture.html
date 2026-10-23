@@ -1,0 +1,1334 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="Current in-process architecture of @korioinc/pi-subagents: execution ownership, lifecycle, catalog discovery, and generation drain."
+    />
+    <title>@korioinc/pi-subagents — Current implementation</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500&amp;display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --paper: #f5f5f5;
+        --ink: #2d3142;
+        --muted: #4f5d75;
+        --rule: #bfc0c0;
+        --accent: #eb6c36;
+        --tint: #f7e9e1;
+        --link: #2e5aa8;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+        font:
+          16px/1.65 "Geist",
+          system-ui,
+          sans-serif;
+      }
+      .page {
+        width: min(1280px, calc(100% - 80px));
+        margin: auto;
+        padding: 36px 0 48px;
+      }
+      .topline,
+      .meta,
+      .eyebrow {
+        font:
+          12px/1.6 "Geist Mono",
+          monospace;
+        color: var(--muted);
+      }
+      .topline {
+        display: flex;
+        justify-content: space-between;
+        gap: 16px;
+        letter-spacing: 0.08em;
+      }
+      nav {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px 24px;
+        border-bottom: 1px solid var(--rule);
+        margin: 20px 0 32px;
+        padding-bottom: 16px;
+        font-size: 14px;
+      }
+      a {
+        color: var(--link);
+        text-underline-offset: 3px;
+      }
+      nav a {
+        color: var(--muted);
+      }
+      h1 {
+        margin: 12px 0;
+        font:
+          400 clamp(36px, 4.5vw, 56px)/1.1 "Instrument Serif",
+          Georgia,
+          serif;
+        letter-spacing: -0.025em;
+        overflow-wrap: anywhere;
+      }
+      .lead {
+        margin: 0 0 12px;
+        font-size: 23px;
+        font-weight: 500;
+      }
+      .intro {
+        max-width: 920px;
+        margin: 0;
+        color: var(--muted);
+      }
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px 28px;
+        margin: 24px 0 36px;
+      }
+      .meta b {
+        color: var(--ink);
+        font-weight: 500;
+        margin-left: 8px;
+      }
+      .section-head {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 20px;
+        border-top: 1px solid var(--rule);
+        padding-top: 20px;
+        margin-top: 32px;
+      }
+      h2 {
+        font-size: 21px;
+        line-height: 1.3;
+        margin: 0 0 12px;
+        font-weight: 600;
+      }
+      .section-head > span {
+        font:
+          12px/1.5 "Geist Mono",
+          monospace;
+        color: var(--muted);
+      }
+      .section-intro {
+        max-width: 960px;
+        margin: 0 0 8px;
+        color: var(--muted);
+      }
+      figure {
+        margin: 0;
+        min-width: 0;
+      }
+      .diagram-container {
+        width: 100%;
+        max-width: 100%;
+        min-width: 0;
+        overflow-x: auto;
+      }
+      svg {
+        display: block;
+        width: 100%;
+        min-width: 1280px;
+        height: auto;
+      }
+      svg .box {
+        fill: #fff;
+        stroke: var(--rule);
+      }
+      svg .focal {
+        fill: var(--tint);
+        stroke: var(--accent);
+        stroke-width: 1.4;
+      }
+      svg .store {
+        fill: #e9e9eb;
+        stroke: var(--muted);
+      }
+      svg .zone {
+        fill: none;
+        stroke: var(--rule);
+        stroke-dasharray: 4 4;
+      }
+      svg .node-name {
+        font-size: 16px;
+        font-weight: 600;
+        fill: var(--ink);
+      }
+      svg .sub,
+      svg .tag,
+      svg .edge-label text {
+        font:
+          12px "Geist Mono",
+          monospace;
+        fill: var(--muted);
+      }
+      svg .tag {
+        letter-spacing: 0.04em;
+      }
+      svg .zone-label {
+        font-size: 14px;
+        font-weight: 500;
+        fill: var(--muted);
+      }
+      svg .edge {
+        fill: none;
+        stroke: var(--muted);
+        stroke-width: 1.4;
+      }
+      svg .return {
+        stroke-dasharray: 5 4;
+      }
+      svg .label-mask {
+        fill: var(--paper);
+      }
+      figcaption {
+        margin: 8px 0 16px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .notes {
+        display: grid;
+        grid-template-columns: 1.15fr 1fr;
+        gap: 16px 40px;
+        margin: 20px 0 0;
+      }
+      .notes p {
+        margin: 0;
+        font-size: 14px;
+        color: var(--muted);
+      }
+      strong {
+        color: var(--ink);
+        font-weight: 600;
+      }
+      code {
+        font-family: "Geist Mono", monospace;
+        font-size: 0.88em;
+        overflow-wrap: anywhere;
+      }
+      .note {
+        margin: 16px 0 0;
+        padding: 16px 20px;
+        background: var(--tint);
+        border: 1px solid #d7b5a5;
+        border-radius: 6px;
+        font-size: 14px;
+      }
+      .bounds {
+        margin: 12px 0 0;
+      }
+      .bounds > div {
+        display: grid;
+        grid-template-columns: 160px 1fr;
+        gap: 20px;
+        padding: 12px 0;
+        border-bottom: 1px solid var(--rule);
+      }
+      .bounds dt {
+        font-weight: 500;
+      }
+      .bounds dd {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      .sources {
+        list-style: none;
+        margin: 8px 0 0;
+        padding: 0;
+      }
+      .sources li {
+        display: grid;
+        grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+        gap: 20px;
+        padding: 12px 0;
+        border-bottom: 1px solid var(--rule);
+        font-size: 14px;
+      }
+      .sources span {
+        color: var(--muted);
+      }
+      footer {
+        display: flex;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 8px 24px;
+        border-top: 1px solid var(--rule);
+        margin-top: 36px;
+        padding-top: 16px;
+        color: var(--muted);
+        font-size: 12px;
+      }
+      p {
+        text-wrap: pretty;
+      }
+      .skip {
+        position: absolute;
+        left: 20px;
+        top: -80px;
+        background: #fff;
+        padding: 12px;
+      }
+      .skip:focus {
+        top: 10px;
+      }
+      :focus-visible {
+        outline: 2px solid var(--link);
+        outline-offset: 5px;
+      }
+      @media (max-width: 760px) {
+        .page {
+          width: calc(100% - 40px);
+          padding-top: 24px;
+        }
+        .topline,
+        .section-head {
+          display: block;
+        }
+        .topline span,
+        .section-head > span {
+          display: block;
+          margin-bottom: 8px;
+        }
+        .lead {
+          font-size: 20px;
+        }
+        .notes,
+        .sources li {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 8px;
+        }
+        .notes {
+          gap: 16px;
+        }
+        .bounds > div {
+          grid-template-columns: minmax(0, 1fr);
+          gap: 4px;
+        }
+      }
+      @page {
+        size: A4 landscape;
+        margin: 12mm;
+      }
+      @media print {
+        body {
+          background: #fff;
+          font-size: 12px;
+        }
+        .page {
+          width: 100%;
+          max-width: none;
+          padding: 0;
+        }
+        nav,
+        .skip {
+          display: none;
+        }
+        .diagram-container {
+          overflow: visible;
+        }
+        svg {
+          min-width: 0;
+          width: 100%;
+        }
+        figure,
+        .notes,
+        .note,
+        .bounds > div,
+        .sources li {
+          break-inside: avoid;
+        }
+        .section-head {
+          break-after: avoid;
+        }
+        a {
+          color: inherit;
+        }
+        h1 {
+          font-size: 36px;
+        }
+        .lead {
+          font-size: 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <a class="skip" href="#main">Skip to content</a>
+    <div class="page">
+      <header>
+        <div class="topline">
+          <span>KORIOINC / PI EXTENSIONS</span><span>CURRENT IMPLEMENTATION</span>
+        </div>
+        <nav aria-label="Architecture sections">
+          <a href="#execution">Execution</a><a href="#lifecycle">Lifecycle</a
+          ><a href="#catalog">Catalog &amp; drain</a><a href="#diagnostics">Diagnostics</a
+          ><a href="#sources">Source index</a><a href="README.md">README</a>
+        </nav>
+        <h1>@korioinc/pi-subagents</h1>
+        <p class="lead">Foreground work, explicitly owned.</p>
+        <p class="intro">
+          One process. Three execution slots by default, user-configurable. Runner coordinates
+          invocation lifetime; Session owns the SDK child. Parent adapters retain authentication and
+          selected tool dispatch. This page maps the current code, not a proposed design.
+        </p>
+        <div class="meta">
+          <span>BASE <b>bf1e4a9 + local refactors</b></span
+          ><span>SOURCE DATE <b>2026-10-23</b></span
+          ><span>MODE <b>FOREGROUND / NO QUEUE</b></span>
+        </div>
+      </header>
+      <main id="main">
+        <section aria-labelledby="execution">
+          <div class="section-head">
+            <h2 id="execution">01 — Execution &amp; ownership</h2>
+            <span>DEPENDENCIES, NOT NETWORK HOPS</span>
+          </div>
+          <p class="section-intro">
+            RunnerPool reserves capacity and deadlines, then synchronously invokes AgentRegistry to
+            commit the parent fence and intent. Only successful commitment enables progress and
+            execution. A failed uncommitted admission clears its own references before releasing the
+            logical lane, so delayed finalization cannot revoke a newer retry. Runtime prepares
+            configuration; Runner coordinates ChildSession and safe cleanup.
+          </p>
+          <figure>
+            <div
+              class="diagram-container"
+              role="region"
+              aria-label="Execution and ownership diagram; scroll horizontally on small screens"
+              tabindex="0"
+            >
+              <svg
+                viewBox="0 0 1280 624"
+                role="img"
+                aria-labelledby="architecture-execution-title architecture-execution-desc"
+              >
+                <title id="architecture-execution-title">
+                  Execution ownership and parent dependencies
+                </title>
+                <desc id="architecture-execution-desc">
+                  Controller enters AgentRegistry, which reserves RunnerPool capacity and commits
+                  admission before Runner prepares through Runtime and starts ChildSession. The
+                  registry supplies in-memory history to each disposable child runtime.
+                </desc>
+                <defs>
+                  <marker
+                    id="architecture-execution-arrow"
+                    markerWidth="8"
+                    markerHeight="6"
+                    refX="7"
+                    refY="3"
+                    orient="auto"
+                  >
+                    <polygon points="0 0, 8 3, 0 6" fill="#4f5d75" />
+                  </marker>
+                </defs>
+                <rect width="1280" height="624" fill="#f5f5f5" />
+                <text class="zone-label" x="24" y="44">Single process · one parent generation</text>
+                <rect class="zone" x="984" y="256" width="288" height="340" rx="8" />
+                <text class="zone-label" x="1000" y="280">Parent services · same process</text>
+                <path
+                  class="edge"
+                  d="M256 156 H328"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M584 156 H664"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M912 140 H1000"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <path
+                  class="edge return"
+                  d="M1000 192 H912"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M788 224 V360"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M664 424 H584"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M912 396 H936 Q944 396 944 388 V360 Q944 352 952 352 H1000"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M912 456 H960 Q968 456 968 464 V504 Q968 512 976 512 H1000"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <g class="edge-label">
+                  <rect class="label-mask" x="260" y="128" width="64" height="18" />
+                  <text x="292" y="141" text-anchor="middle">SUBMIT</text>
+                  <rect class="label-mask" x="592" y="128" width="64" height="18" />
+                  <text x="624" y="141" text-anchor="middle">ADMIT</text>
+                  <rect class="label-mask" x="920" y="112" width="72" height="18" />
+                  <text x="956" y="125" text-anchor="middle">PREPARE</text>
+                  <rect class="label-mask" x="920" y="202" width="72" height="18" />
+                  <text x="956" y="215" text-anchor="middle">CONFIG</text>
+                  <rect class="label-mask" x="800" y="278" width="128" height="18" />
+                  <text x="864" y="291" text-anchor="middle">LIFECYCLE</text>
+                  <rect class="label-mask" x="592" y="396" width="64" height="18" />
+                  <text x="624" y="409" text-anchor="middle">HISTORY</text>
+                </g>
+                <g data-node="controller">
+                  <rect class="focal" x="24" y="104" width="232" height="120" rx="6" />
+                  <text class="tag" x="44" y="132">CONTROLLER + REGISTRY</text>
+                  <text class="node-name" x="44" y="160">Logical admission</text>
+                  <text class="sub" x="44" y="184">validate + fence + intent</text>
+                  <text class="sub" x="44" y="204">authorize every disclosure</text>
+                </g>
+                <g data-node="pool">
+                  <rect class="focal" x="328" y="104" width="256" height="120" rx="6" />
+                  <text class="tag" x="348" y="132">BEFORE CAPTURE / DISCOVERY</text>
+                  <text class="node-name" x="348" y="160">RunnerPool</text>
+                  <text class="sub" x="348" y="184">3 slots default · configurable</text>
+                  <text class="sub" x="348" y="204">startup + run deadlines</text>
+                </g>
+                <g data-node="runner">
+                  <rect class="box" x="664" y="104" width="248" height="120" rx="6" />
+                  <text class="tag" x="684" y="132">ADMITTED INVOCATION</text>
+                  <text class="node-name" x="684" y="160">Runner</text>
+                  <text class="sub" x="684" y="184">host + mode-aware prompt</text>
+                  <text class="sub" x="684" y="204">budget / pending ledger</text>
+                </g>
+                <g data-node="runtime">
+                  <rect class="box" x="1000" y="104" width="256" height="120" rx="6" />
+                  <text class="tag" x="1020" y="132">IN-PROCESS COLLABORATOR</text>
+                  <text class="node-name" x="1020" y="160">Runtime preparation</text>
+                  <text class="sub" x="1020" y="184">agents / skills / tools</text>
+                  <text class="sub" x="1020" y="204">bounded, frozen config</text>
+                </g>
+                <path
+                  class="edge"
+                  d="M720 504 V544 Q720 552 712 552 H280 Q272 552 272 544 V424 Q272 416 264 416 H256"
+                  marker-end="url(#architecture-execution-arrow)"
+                />
+                <g class="edge-label">
+                  <rect class="label-mask" x="476" y="524" width="124" height="18" />
+                  <text x="538" y="537" text-anchor="middle">OWNED MCP</text>
+                </g>
+                <g data-node="child-mcp">
+                  <rect class="box" x="24" y="368" width="232" height="112" rx="6" />
+                  <text class="tag" x="44" y="396">SEPARATE USER CONFIG</text>
+                  <text class="node-name" x="44" y="424">Selected MCP clients</text>
+                  <text class="sub" x="44" y="452">direct / search + call</text>
+                </g>
+                <g data-node="sdk-history">
+                  <rect class="store" x="328" y="368" width="256" height="112" rx="6" />
+                  <text class="tag" x="348" y="396">REGISTRY-OWNED, SDK-NATIVE</text>
+                  <text class="node-name" x="348" y="424">Native child history</text>
+                  <text class="sub" x="348" y="452">generation-local memory</text>
+                </g>
+                <g data-node="session-adapter">
+                  <rect class="box" x="664" y="360" width="248" height="144" rx="6" />
+                  <text class="tag" x="684" y="388">SRC/SESSION</text>
+                  <text class="node-name" x="684" y="416">ChildSession</text>
+                  <text class="sub" x="684" y="444">owns SDK child + events</text>
+                  <text class="sub" x="684" y="468">prompt / stream / usage</text>
+                  <text class="sub" x="684" y="488">abort / shutdown / dispose</text>
+                </g>
+                <g data-node="parent-model">
+                  <rect class="box" x="1000" y="304" width="256" height="112" rx="6" />
+                  <text class="tag" x="1020" y="332">MODEL PATH</text>
+                  <text class="node-name" x="1020" y="360">Parent model dispatch</text>
+                  <text class="sub" x="1020" y="384">modelRegistry.streamSimple</text>
+                  <text class="sub" x="1020" y="404">parent auth / OAuth</text>
+                </g>
+                <g data-node="parent-tool">
+                  <rect class="box" x="1000" y="456" width="256" height="112" rx="6" />
+                  <text class="tag" x="1020" y="484">ORDINARY TOOLS ONLY</text>
+                  <text class="node-name" x="1020" y="512">Parent tool dispatch</text>
+                  <text class="sub" x="1020" y="536">ctx.executeTool()</text>
+                  <text class="sub" x="1020" y="556">parent permission hooks</text>
+                </g>
+                <text class="sub" x="24" y="588">
+                  Solid arrows: work / dependency · dashed: configuration return
+                </text>
+              </svg>
+            </div>
+            <figcaption>
+              Results settle through ChildSession → Runner → AgentRegistry history validation →
+              RunnerPool → Controller. Delivery requires the same generation, parent session,
+              workspace and project-trust state, with the latest accepted input fence on the branch.
+              Continuation requires a validated parent fence; a null fence grants no authority. All
+              agents require a manually created definition in the user agents directory. Definitions
+              can explicitly select local
+              <code>read_text</code> / <code>list_files</code> when absent from parent tools.
+              <a href="src/controller/index.ts">Controller</a> ·
+              <a href="src/runner/index.ts">Runner</a> · <a href="src/runtime/index.ts">Runtime</a>
+            </figcaption>
+          </figure>
+          <div class="notes">
+            <p>
+              <strong>Capabilities follow tools, not inherited text.</strong> Append inherits the
+              parent policy without resource catalogs, followed by the fixed subagent role. Replace
+              starts with the optional <code>prompt_instruction_path</code> file, then the fixed
+              role, without the parent prompt. These inputs form the native preamble. The SDK then
+              renders the agent body as <code>&lt;addendum&gt;</code>, eligible skills, cwd and the
+              indirect MCP catalog. Replace requires a nonempty body. Disabled definitions and
+              unknown semantic fields fail closed.
+            </p>
+            <p>
+              <strong>Shared workspace and stable authority.</strong> Named agents may mutate the
+              parent workspace through selected tools. Same-path directory replacement revokes
+              retained authority. Parent-dispatched tools retain permission hooks and combined
+              cancellation. The SDK's native <code>write</code>/<code>edit</code> queue serializes
+              same-file operations within its process/module; it does not cover <code>bash</code>,
+              MCP or the whole workspace. Native child conversation retention is separate from
+              volatile run answers.
+            </p>
+          </div>
+          <p class="note">
+            Session passes native <code>systemPrompt</code>, <code>appendSystemPrompt</code> and
+            selected-only <code>skillsOverride</code> inputs to the SDK resource loader. No custom
+            composer or forced final prompt remains. The task is a separate initial user message
+            inside <code>&lt;subagent_task&gt;</code>, with <code>&amp;&lt;&gt;</code> escaped as
+            XML text. Optional reference warning and <code>REFERENCE</code> JSON come before that
+            task block. Each spawn starts a new conversation without parent entries; follow-up
+            retains only that child’s native history.
+          </p>
+          <p class="note">
+            <strong>One resource owner, one completion coordinator.</strong> Session implements SDK
+            construction, binding, events and teardown. The native provider bridge uses public
+            <code>Provider.streamSimple</code> and <code>lazyStream</code>, not an agent stream
+            override. It owns producer settlement, late fetch acquisition and reader cleanup;
+            terminal delivery alone cannot release a request. Before each dispatch, ParentProvider
+            checks the actual system text and effective tool declarations, including dynamic SDK
+            changes. Runner orders <code>abort() → Budget.drain() → close()</code> before Pool
+            settlement. Abort starts MCP closure but waits only for SDK abort. After operation
+            drainage, close joins MCP and provider closure alongside SDK shutdown/disposal; an idle
+            SDK no longer waits for MCP closure. Final settlement still requires every owner.
+            Session reports transport promises into Runner's existing ledger; it does not create a
+            second ledger or custom conversation engine.
+            <a href="src/session/index.ts">ChildSession implementation</a>.
+          </p>
+        </section>
+        <section aria-labelledby="lifecycle">
+          <div class="section-head">
+            <h2 id="lifecycle">02 — Lifecycle &amp; completion</h2>
+            <p>
+              <code>spawn_agent</code> creates a new <code>agentId</code> and first
+              <code>runId</code>. <code>followup_task({ agentId, requestId, message })</code> gives
+              an idle agent a fresh foreground runtime with current policy/tools and its native
+              conversation. A running agent instead receives steering and a receipt with no usage or
+              independent answer; the original run retains its remaining budget, deadline and
+              completion owner. Identical authorized retries return receipts without repeated
+              effects or usage. <code>send_message</code> stays supplemental data, not a task or new
+              turn.
+            </p>
+            <p>
+              <code>close_agent({ agentId })</code> idempotently closes idle or history-unusable
+              agents and releases in-memory history and receipts. Active/blocked work must first be
+              interrupted and safely settled. Spawn, follow-up and close are direct model-only
+              tools, denied to children. <code>subagent_inspect</code> accepts one of
+              <code>runId</code>, <code>agentId</code> or
+              <code>scope: &quot;runs&quot; | &quot;agents&quot;</code>; no selector preserves run
+              inspection. Agent inspection returns metadata/receipts, never transcripts or
+              credentials. Controls, results, handoffs and activity require the same
+              parent/workspace and a branch containing the latest accepted input fence. Existing
+              activity presentation is unchanged.
+            </p>
+            <p>
+              AgentRegistry owns native <code>SessionManager.inMemory()</code> history until
+              explicit close or the parent extension generation ends. Idle history has no time-based
+              expiry. Reload, parent-session replacement and exit drain owned work, then discard
+              history. A later generation cannot reopen the conversation. Terminal results and
+              closed-agent tombstones retain their separate one-hour limits.
+            </p>
+            <p>
+              Memory capacity failures mark history <code>history_unusable</code> and stop
+              continuation rather than truncate it. Disk storage and backups are outside this
+              package; earlier disk files remain untouched, without migration or deletion. No
+              automatic replay or background execution is added. See the
+              <a href="README.md#memory-only-history-lifetime">memory-only history lifetime</a>
+              and <a href="README.md#agent-continuations">agent continuation guide</a>.
+            </p>
+            <span>POOL PHASES ARE AUTHORITATIVE</span>
+          </div>
+          <p class="section-intro">
+            Execution ending starts settlement, not release. Stop requests cancel further work;
+            cleanup and accounting still own the slot and foreground completion.
+          </p>
+          <figure>
+            <div
+              class="diagram-container"
+              role="region"
+              aria-label="Run lifecycle diagram; scroll horizontally on small screens"
+              tabindex="0"
+            >
+              <svg
+                viewBox="0 0 1280 520"
+                role="img"
+                aria-labelledby="architecture-lifecycle-title architecture-lifecycle-desc"
+              >
+                <title id="architecture-lifecycle-title">
+                  Run phases and the safe completion barrier
+                </title>
+                <desc id="architecture-lifecycle-desc">
+                  Preparing and running lead to settling; stop intent can enter cancelling, grace
+                  expiry enters blocked, and only a safe settlement resolves terminal, including a
+                  direct blocked-to-terminal transition if the executor is still pending.
+                </desc>
+                <defs>
+                  <marker
+                    id="architecture-lifecycle-arrow"
+                    markerWidth="8"
+                    markerHeight="6"
+                    refX="7"
+                    refY="3"
+                    orient="auto"
+                  >
+                    <polygon points="0 0, 8 3, 0 6" fill="#4f5d75" />
+                  </marker>
+                </defs>
+                <rect width="1280" height="520" fill="#f5f5f5" />
+                <path
+                  class="edge"
+                  d="M244 164 H328"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M548 164 H664"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M912 164 H1000"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M134 104 V64 Q134 56 142 56 H780 Q788 56 788 64 V104"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M134 224 V380 Q134 388 142 388 H328"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M438 224 V340"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M548 372 H600 Q608 372 608 364 V216 Q608 208 616 208 H664"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M548 416 H664"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M788 224 V340"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M912 400 H1120 Q1128 400 1128 392 V224"
+                  marker-end="url(#architecture-lifecycle-arrow)"
+                />
+                <g class="edge-label">
+                  <rect class="label-mask" x="252" y="136" width="68" height="18" />
+                  <text x="286" y="149" text-anchor="middle">START</text>
+                  <rect class="label-mask" x="572" y="136" width="68" height="18" />
+                  <text x="606" y="149" text-anchor="middle">ENDS</text>
+                  <rect class="label-mask" x="924" y="136" width="64" height="18" />
+                  <text x="956" y="149" text-anchor="middle">SAFE</text>
+                  <rect class="label-mask" x="400" y="28" width="124" height="18" />
+                  <text x="462" y="41" text-anchor="middle">PREP ENDS</text>
+                  <rect class="label-mask" x="146" y="276" width="64" height="18" />
+                  <text x="178" y="289" text-anchor="middle">STOP</text>
+                  <rect class="label-mask" x="450" y="276" width="64" height="18" />
+                  <text x="482" y="289" text-anchor="middle">STOP</text>
+                  <rect class="label-mask" x="620" y="276" width="92" height="18" />
+                  <text x="666" y="289" text-anchor="middle">WORK ENDS</text>
+                  <rect class="label-mask" x="560" y="388" width="92" height="18" />
+                  <text x="606" y="401" text-anchor="middle">5S GRACE</text>
+                  <rect class="label-mask" x="800" y="276" width="112" height="18" />
+                  <text x="856" y="289" text-anchor="middle">STOP + GRACE</text>
+                  <rect class="label-mask" x="976" y="372" width="104" height="18" />
+                  <text x="1028" y="385" text-anchor="middle">LATE SAFE</text>
+                </g>
+                <g data-node="preparing">
+                  <rect class="box" x="24" y="104" width="220" height="120" rx="8" />
+                  <text class="tag" x="44" y="132">ADMITTED</text>
+                  <text class="node-name" x="44" y="160">preparing</text>
+                  <text class="sub" x="44" y="184">policy + bounded reads</text>
+                  <text class="sub" x="44" y="204">child creation</text>
+                </g>
+                <g data-node="running">
+                  <rect class="box" x="328" y="104" width="220" height="120" rx="8" />
+                  <text class="tag" x="348" y="132">EXECUTING</text>
+                  <text class="node-name" x="348" y="160">running</text>
+                  <text class="sub" x="348" y="184">child model + tools</text>
+                  <text class="sub" x="348" y="204">owned delegated calls</text>
+                </g>
+                <g data-node="settling">
+                  <rect class="box" x="664" y="104" width="248" height="120" rx="8" />
+                  <text class="tag" x="684" y="132">COMPLETION BARRIER</text>
+                  <text class="node-name" x="684" y="160">settling</text>
+                  <text class="sub" x="684" y="184">calls / callbacks / SDK</text>
+                  <text class="sub" x="684" y="204">cleanup + final usage</text>
+                </g>
+                <g data-node="terminal">
+                  <rect class="focal" x="1000" y="104" width="256" height="120" rx="8" />
+                  <text class="tag" x="1020" y="132">SAFE OWNERSHIP RESOLVED</text>
+                  <text class="node-name" x="1020" y="160">terminal</text>
+                  <text class="sub" x="1020" y="184">success / failure / cancel</text>
+                  <text class="sub" x="1020" y="204">release + resolve once</text>
+                </g>
+                <g data-node="cancelling">
+                  <rect class="box" x="328" y="340" width="220" height="124" rx="8" />
+                  <text class="tag" x="348" y="368">STOP INTENT</text>
+                  <text class="node-name" x="348" y="396">cancelling</text>
+                  <text class="sub" x="348" y="420">no further work</text>
+                  <text class="sub" x="348" y="444">await owned operations</text>
+                </g>
+                <g data-node="blocked">
+                  <rect class="focal" x="664" y="340" width="248" height="124" rx="8" />
+                  <text class="tag" x="684" y="368">PROGRESS, NOT COMPLETION</text>
+                  <text class="node-name" x="684" y="396">blocked</text>
+                  <text class="sub" x="684" y="420">slot + foreground held</text>
+                  <text class="sub" x="684" y="444">unknown safety: stay here</text>
+                </g>
+                <text class="sub" x="24" y="504">
+                  Late-safe edge requires a still-pending executor; blocked never transitions back
+                  to settling.
+                </text>
+              </svg>
+            </div>
+            <figcaption>
+              Updates report admission, running, settling, and blocked states; inspect/cancel reads
+              the current phase. Progress never releases ownership. Pre-dispatch abort or expiry can
+              go straight to terminal. Terminal releases the slot, then retains a bounded volatile
+              answer.
+              <a href="src/runner-pool/index.ts">RunnerPool.submit / stop</a>
+            </figcaption>
+          </figure>
+          <p class="note">
+            <strong>Executor rejection is different from late cleanup.</strong> Rejection
+            immediately leaves the run <code>blocked</code>, with no future settlement continuation
+            or autonomous recovery. A blocked run marks pool health degraded but retains only its
+            own slot. Other free slots remain usable. That run's foreground completion and the
+            shutdown barrier remain pending while cleanup is unconfirmed. Stop during settlement
+            preserves the outcome; the 5s grace starts at the first stop request, not at entry to
+            settling.
+          </p>
+          <div class="notes">
+            <p>
+              <strong>One usage owner per path.</strong> Outer result carries child-model usage.
+              Parent tool dispatch records nested tool usage; forwarded results omit duplicates.
+              Parent SDK combines both exactly once.
+            </p>
+            <p>
+              <strong>Cleanup precedes completion.</strong> Runner waits for started delegated
+              calls, callbacks, provider/transport cleanup, and safe SDK shutdown. A grace timeout
+              reports blocked; it does not prove safety.
+            </p>
+          </div>
+        </section>
+        <section aria-labelledby="catalog">
+          <div class="section-head">
+            <h2 id="catalog">03 — Catalog &amp; generation drain</h2>
+            <span>SEPARATE LIFETIME · NO EXECUTION SLOT</span>
+          </div>
+          <p class="section-intro">
+            AgentCatalog owns one catalog API list task per generation; admitted named runs discover
+            independently. Concurrent lists return <code>busy</code>; unsafe or draining catalogs
+            return <code>unavailable</code>. Discovery starts no child, provider call, or tool
+            execution.
+          </p>
+          <figure>
+            <div
+              class="diagram-container"
+              role="region"
+              aria-label="Catalog listing and concurrent shutdown drain; scroll horizontally on small screens"
+              tabindex="0"
+            >
+              <svg
+                viewBox="0 0 1280 624"
+                role="img"
+                aria-labelledby="architecture-catalog-title architecture-catalog-desc"
+              >
+                <title id="architecture-catalog-title">
+                  Catalog ownership and concurrent generation drain
+                </title>
+                <desc id="architecture-catalog-desc">
+                  Catalog listing runs one bounded discovery task without an execution slot, while
+                  session shutdown concurrently cancels and awaits pool and catalog drains; unsafe
+                  catalog cleanup disables later listings and keeps its own promise pending without
+                  draining the pool.
+                </desc>
+                <defs>
+                  <marker
+                    id="architecture-catalog-arrow"
+                    markerWidth="8"
+                    markerHeight="6"
+                    refX="7"
+                    refY="3"
+                    orient="auto"
+                  >
+                    <polygon points="0 0, 8 3, 0 6" fill="#4f5d75" />
+                  </marker>
+                </defs>
+                <rect width="1280" height="624" fill="#f5f5f5" />
+                <text class="zone-label" x="24" y="44">Catalog request</text>
+                <path
+                  class="edge"
+                  d="M256 164 H328"
+                  marker-end="url(#architecture-catalog-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M584 164 H664"
+                  marker-end="url(#architecture-catalog-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M912 164 H1000"
+                  marker-end="url(#architecture-catalog-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M256 388 H280 Q288 388 288 380 V372 Q288 364 296 364 H328"
+                  marker-end="url(#architecture-catalog-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M140 468 V512 Q140 520 148 520 H328"
+                  marker-end="url(#architecture-catalog-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M584 364 H952 Q960 364 960 372 V380 Q960 388 968 388 H1000"
+                  marker-end="url(#architecture-catalog-arrow)"
+                />
+                <path
+                  class="edge"
+                  d="M584 520 H1120 Q1128 520 1128 512 V468"
+                  marker-end="url(#architecture-catalog-arrow)"
+                />
+                <g class="edge-label">
+                  <rect class="label-mask" x="260" y="136" width="64" height="18" />
+                  <text x="292" y="149" text-anchor="middle">LIST</text>
+                  <rect class="label-mask" x="592" y="136" width="64" height="18" />
+                  <text x="624" y="149" text-anchor="middle">SCAN</text>
+                  <rect class="label-mask" x="920" y="136" width="72" height="18" />
+                  <text x="956" y="149" text-anchor="middle">RETURN</text>
+                  <rect class="label-mask" x="724" y="336" width="88" height="18" />
+                  <text x="768" y="349" text-anchor="middle">AWAIT</text>
+                  <rect class="label-mask" x="812" y="492" width="88" height="18" />
+                  <text x="856" y="505" text-anchor="middle">AWAIT</text>
+                </g>
+                <g data-node="catalog-entry">
+                  <rect class="box" x="24" y="104" width="232" height="120" rx="6" />
+                  <text class="tag" x="44" y="132">CONTROLLER TOOL</text>
+                  <text class="node-name" x="44" y="160">list_agents</text>
+                  <text class="sub" x="44" y="184">bounded tool response</text>
+                  <text class="sub" x="44" y="204">no execution admission</text>
+                </g>
+                <g data-node="catalog-owner">
+                  <rect class="focal" x="328" y="104" width="256" height="120" rx="6" />
+                  <text class="tag" x="348" y="132">ONE OWNED TASK</text>
+                  <text class="node-name" x="348" y="160">AgentCatalog.list()</text>
+                  <text class="sub" x="348" y="184">active → busy</text>
+                  <text class="sub" x="348" y="204">draining → unavailable</text>
+                </g>
+                <g data-node="catalog-discovery">
+                  <rect class="box" x="664" y="104" width="248" height="120" rx="6" />
+                  <text class="tag" x="684" y="132">BOUNDED PREPARATION</text>
+                  <text class="node-name" x="684" y="160">Agent discovery</text>
+                  <text class="sub" x="684" y="184">roots / reads / parse</text>
+                  <text class="sub" x="684" y="204">60s startup deadline</text>
+                </g>
+                <g data-node="catalog-result">
+                  <rect class="box" x="1000" y="104" width="256" height="120" rx="6" />
+                  <text class="tag" x="1020" y="132">BOUNDED CATALOG</text>
+                  <text class="node-name" x="1020" y="160">Names &amp; diagnostics</text>
+                  <text class="sub" x="1020" y="184">omission counts included</text>
+                  <text class="sub" x="1020" y="204">partial ≠ absent</text>
+                </g>
+                <g data-node="shutdown">
+                  <rect class="box" x="24" y="348" width="232" height="120" rx="6" />
+                  <text class="tag" x="44" y="376">CONTROLLER EVENT</text>
+                  <text class="node-name" x="44" y="404">session_shutdown</text>
+                  <text class="sub" x="44" y="428">start both drains</text>
+                  <text class="sub" x="44" y="448">concurrently</text>
+                </g>
+                <g data-node="pool-drain">
+                  <rect class="box" x="328" y="312" width="256" height="104" rx="6" />
+                  <text class="tag" x="348" y="340">CANCEL RUNS</text>
+                  <text class="node-name" x="348" y="368">pool.drain()</text>
+                  <text class="sub" x="348" y="396">await every run.done</text>
+                </g>
+                <g data-node="catalog-drain">
+                  <rect class="box" x="328" y="468" width="256" height="104" rx="6" />
+                  <text class="tag" x="348" y="496">CANCEL SCAN</text>
+                  <text class="node-name" x="348" y="524">catalog.drain()</text>
+                  <text class="sub" x="348" y="552">await owned catalog task</text>
+                </g>
+                <g data-node="await-drains">
+                  <rect class="focal" x="1000" y="348" width="256" height="120" rx="6" />
+                  <text class="tag" x="1020" y="376">GENERATION BARRIER</text>
+                  <text class="node-name" x="1020" y="404">Await both drains</text>
+                  <text class="sub" x="1020" y="428">then discard generation</text>
+                  <text class="sub" x="1020" y="448">unsafe → remain pending</text>
+                </g>
+                <text class="sub" x="664" y="588">
+                  Unsafe catalog: own promise held; pool continues.
+                </text>
+              </svg>
+            </div>
+            <figcaption>
+              Shutdown rejects new work, cancels owned work, and awaits both lifetimes. Unsafe
+              catalog cleanup disables later listings and retains its own unresolved promise;
+              existing runs and independent per-run discovery continue.
+              <a href="src/controller/index.ts">Shutdown handler</a> ·
+              <a href="src/controller/catalog.ts">AgentCatalog</a>
+            </figcaption>
+          </figure>
+        </section>
+        <section aria-labelledby="mcp">
+          <div class="section-head">
+            <h2 id="mcp">Child-owned selected MCP</h2>
+            <span>NO PARENT MCP FALLBACK</span>
+          </div>
+          <p class="section-intro">
+            <code>mcp: [figma-bridge]</code> selects only entries in
+            <code>mcp-sub-agents.json</code>. ChildSession connects every selected server before
+            prompting. Parent MCP, codemode, search/resource routes and declared aggregators are not
+            inherited.
+          </p>
+          <dl class="bounds">
+            <div>
+              <dt>Small model context</dt>
+              <dd>
+                Default codemode exposure uses native child <code>ALL_TOOLS</code>,
+                <code>searchTools()</code>, <code>describeTool()</code> and
+                <code>tools.mcp__…()</code>. Native child tool_search activates deferred tools;
+                direct tools are declared and hidden tools remain unreachable. The SDK server
+                catalog advertises indirect codemode/deferred access; direct tools use declarations.
+                No parent registry is inherited.
+              </dd>
+            </div>
+            <div>
+              <dt>Owned from acquisition</dt>
+              <dd>
+                Abort starts MCP closure and SDK cancellation concurrently, then Runner drains
+                Budget. First-close failures remain unsafe. Native registrations and nested calls
+                retain time and output budgets. Each actual tool call consumes one start; codemode
+                itself consumes neither the tool allowance nor a leaf concurrency slot.
+              </dd>
+            </div>
+            <div>
+              <dt>Explicit permissions</dt>
+              <dd>
+                Selected user-configured servers authorize child-local calls; parent permission
+                extensions are not inherited. Stdio receives minimal operational environment plus
+                explicit values. HTTP redirects and oversized bodies are rejected.
+              </dd>
+            </div>
+          </dl>
+          <p class="note">
+            Supported: stdio and HTTPS/loopback HTTP with explicit env/header credentials.
+            OAuth/provider-token auth and command-based secrets remain unsupported. Native
+            resources, dynamic tool-list refresh and schema validation follow main Pi within the
+            selected server set. See
+            <a href="README.md#child-owned-mcp">configuration and native SDK boundaries</a>. No live
+            user MCP server was used for local validation.
+          </p>
+        </section>
+        <section aria-labelledby="skills">
+          <div class="section-head">
+            <h2 id="skills">Explicit child skills</h2>
+            <span>PARENT ACTIVATION UNCHANGED</span>
+          </div>
+          <p class="section-intro">
+            The extension catalogs bounded local default/settings/package candidates, including
+            parent-disabled skills. Only explicitly selected names, descriptions and locations go to
+            the native resource loader. The SDK renders <code>&lt;skills&gt;</code> when native
+            <code>read</code> or <code>bash</code> is selected; a hidden direct declaration uses
+            indirect-access wording. Empty tools, <code>read_text</code> alone and arbitrary
+            custom/MCP readers do not qualify. Candidate and selected frontmatter are read and
+            revalidated. Runtime execution preparation validates selected bodies and computes the
+            continuation fingerprint without inserting bodies into the initial prompt. Explicit
+            selection opts in <code>disable-model-invocation: true</code> skills under the same
+            reader gate. No package installation, network lookup or parent activation changes occur.
+            Package manifest exclusions still apply; duplicate names keep the first valid discovered
+            skill.
+          </p>
+          <p class="note">
+            Unknown dynamic roots require explicit local settings paths.
+            <code>skill_add_folders</code> and <code>skills: all</code> are removed. Append replaces
+            parent skill, tool and MCP catalogs and removes this extension's exact native delegation
+            rules. Generated parent cwd is removed only when no custom cwd section was supplied;
+            explicit custom cwd policy is preserved. Other policy sections are preserved; opaque
+            forced prompts fail. Neither mode inherits parent package/extension skill catalogs.
+            Omitted or empty skill selection advertises none and performs no skill discovery.
+            <code>@name task</code> requests parent-model delegation through
+            <code>spawn_agent({ agent, task })</code>; it does not guarantee execution. See
+            <a href="README.md">source coverage and migration</a>.
+          </p>
+        </section>
+        <section aria-labelledby="diagnostics">
+          <div class="section-head">
+            <h2 id="diagnostics">Diagnose without unlocking</h2>
+            <span>OBSERVATIONS, NOT SAFETY EVIDENCE</span>
+          </div>
+          <p class="section-intro">
+            <code>subagent_inspect({ runId })</code> separates pool phase from Runner stage. The
+            no-ID form also includes catalog health and origin-authorized scan diagnostics. These
+            snapshots never change admission, cancellation or completion.
+          </p>
+          <dl class="bounds">
+            <div>
+              <dt>Where and how long</dt>
+              <dd>
+                Current stage, phase/stage age, admission and first-stop time. Monotonic durations
+                freeze at terminal completion; repeated cancellation does not reset them.
+              </dd>
+            </div>
+            <div>
+              <dt>What still owns work</dt>
+              <dd>
+                <code>pendingTools</code> and <code>pendingTransports</code> count tracked top-level
+                calls and provider requests through cleanup, not every nested operation or socket.
+                Zero is not proof of safety.
+              </dd>
+            </div>
+            <div>
+              <dt>Recovery distinction</dt>
+              <dd>
+                Blocked <code>recovery: await_owned_work</code> may still settle safely.
+                <code>recovery: containment_required</code> means no automatic recovery
+                continuation. <code>stage: mcp_close</code> means SDK cleanup attempts finished
+                while MCP closure remains pending. None of these observations authorizes force
+                release or automatic replay.
+              </dd>
+            </div>
+          </dl>
+          <div class="notes">
+            <p>
+              <strong>Bounded, owner-only activity.</strong> ID-specific inspect adds
+              budget-admission totals and up to eight recent SDK tool names/states. Names are capped
+              at 128 UTF-8 bytes; arguments, results, raw errors, prompts and credentials are
+              excluded. Activity is absent from progress, final/cancel responses and no-ID lists.
+              Tool names can identify servers; the same session and submission-anchor ancestry is
+              required.
+            </p>
+            <p>
+              <strong>Containment is not recovery.</strong> A blocked run retains its own slot;
+              other free slots remain usable. Unsafe catalog cleanup disables only catalog listings.
+              Unsafe cleanup retains its owner's foreground completion and shutdown barrier.
+              Remaining capacity does not isolate shared-workspace or external effects. Process
+              termination may lose volatile results and usage; never automatically replay accepted
+              work.
+            </p>
+          </div>
+          <p class="note">
+            <strong>SDK adapter is in Session.</strong> Runner retains orchestration and budgets.
+            Stable SDK <code>&gt;=1.4.0 &lt;2.0.0</code> is supported. The development workspace
+            uses SDK 1.4.0.
+          </p>
+        </section>
+        <section aria-labelledby="bounds">
+          <div class="section-head">
+            <h2 id="bounds">Runtime bounds</h2>
+            <span>COOPERATIVE LIMITS, NOT ISOLATION</span>
+          </div>
+          <dl class="bounds">
+            <div>
+              <dt>Execution</dt>
+              <dd>
+                <strong>3 runs by default</strong> · startup <strong>60s</strong> · invocation
+                <strong>30m</strong> · stop grace <strong>5s</strong>. Full → <code>busy</code>;
+                draining → <code>unavailable</code>; degraded → remaining capacity usable. No queue.
+                Set <code>maxConcurrentRuns</code> from 1 through 32 in user
+                <code>sub-agents.json</code>; reload to apply. Each provider owner serializes its
+                requests through transport cleanup. Each run permits
+                <strong>256 actual tool starts</strong> and
+                <strong>4 concurrent leaf tools</strong>. Codemode itself is excluded; each nested
+                tool call consumes one start.
+              </dd>
+            </div>
+            <div>
+              <dt>Preparation</dt>
+              <dd>
+                Per file <strong>64 KiB</strong> · candidate reads <strong>8 MiB</strong> · roots
+                <strong>32</strong> · entries <strong>4096</strong> · depth <strong>16</strong> ·
+                prompt/configuration <strong>4 MiB</strong>. Preparation checks raw inputs;
+                preflight leaves <code>rendered_prompt</code> unchecked, along with
+                <code>skill_body_validation</code> when skills are selected. Startup checks the SDK
+                prompt, and each dispatch checks final system text plus effective tool declarations.
+              </dd>
+            </div>
+            <div>
+              <dt>Retention</dt>
+              <dd>
+                <strong>32 terminal answers</strong> · <strong>1h</strong> ·
+                <strong>256 KiB</strong> per answer · <strong>32 open agents</strong> ·
+                <strong>256 MiB</strong> generation history. Volatile and origin-scoped. Active or
+                blocked ownership never expires. Each serialized tool result or update has a
+                <strong>64 MiB</strong> ceiling, checked after JSON serialization. SDK text
+                formatting/spill and structured results remain native. No aggregate tool-result
+                memory is reserved. Cumulative model tokens are uncapped unless the definition sets
+                <code>max_model_tokens</code>.
+              </dd>
+            </div>
+          </dl>
+          <p class="section-intro">
+            Turn, invocation, and tool deadlines enter <strong>safe guard</strong>: no new work, up
+            to <strong>30s</strong> to finish existing operations, then one no-tools handoff (up to
+            <strong>60s / 2,048 output tokens</strong>, within a <strong>90s</strong> window). The
+            result remains incomplete. Hard cancellation and token caps still win; unresolved
+            cleanup retains ownership and prevents summarization.
+          </p>
+          <p class="section-intro" style="font-size: 14px; margin-top: 16px">
+            These bounds do not universally cap provider retries, billing, process memory, or
+            non-cooperative operations. No timeout proves cleanup safety.
+            <a href="src/runtime/limits.ts">Preparation limits</a> ·
+            <a href="src/runner/budget.ts">Run budgets</a> ·
+            <a href="src/runner-pool/index.ts">Pool and retention</a>
+          </p>
+        </section>
+        <section aria-labelledby="sources">
+          <div class="section-head">
+            <h2 id="sources">Source index</h2>
+            <span>0e74535 BASE + CHILD MCP · 2026-10-17</span>
+          </div>
+          <ul class="sources">
+            <li>
+              <div>
+                <a href="src/instructions/parent.ts"><code>src/instructions/parent.ts</code></a
+                ><br /><a href="src/instructions/subagent.ts"
+                  ><code>src/instructions/subagent.ts</code></a
+                >
+              </div>
+              <span>Fixed parent delegation and child role text; no runtime dependencies.</span>
+            </li>
+            <li>
+              <div>
+                <a href="src/controller/index.ts"><code>src/controller/index.ts</code></a
+                ><br /><a href="src/controller/catalog.ts"><code>src/controller/catalog.ts</code></a
+                ><br /><a href="src/controller/spawn-description.ts"
+                  ><code>src/controller/spawn-description.ts</code></a
+                >
+              </div>
+              <span
+                >Tool registration, origin checks, parent adapters, shutdown; separately owned
+                catalog lifetime and bounded description rendering.</span
+              >
+            </li>
+            <li>
+              <a href="src/runner-pool/index.ts"><code>src/runner-pool/index.ts</code></a
+              ><span
+                >Atomic admission, deadlines, authoritative phases, cancellation, drain, bounded
+                terminal records.</span
+              >
+            </li>
+            <li>
+              <div>
+                <a href="src/runner/index.ts"><code>src/runner/index.ts</code></a
+                ><br /><a href="src/runner/budget.ts"><code>src/runner/budget.ts</code></a>
+              </div>
+              <span
+                >Policy capture, preparation/execution order, one pending-work ledger, budgets and
+                final cleanup coordination.</span
+              >
+            </li>
+            <li>
+              <div>
+                <a href="src/session/index.ts"><code>src/session/index.ts</code></a
+                ><br />
+                <a href="src/session/provider.ts"><code>src/session/provider.ts</code></a
+                ><br />
+                <a href="src/session/tools.ts"><code>src/session/tools.ts</code></a
+                ><br />
+                <a href="src/session/resources.ts"><code>src/session/resources.ts</code></a>
+              </div>
+              <span
+                >ChildSession owns SDK lifecycle and message accounting. ParentProvider owns
+                serialized native model requests and transport cleanup. ChildTools owns native tool
+                activation, guarded registration and selected-server readiness. Resources installs
+                the explicit loader, prompts and request-local context.</span
+              >
+            </li>
+            <li>
+              <a href="src/runtime/index.ts"><code>src/runtime/index.ts</code></a>
+              <span
+                >Bounded preparation and native prompt inputs; SDK owns final rendering, with no
+                live session ownership in Runtime.</span
+              >
+            </li>
+            <li>
+              <div>
+                <a href="src/runtime/agents.ts"><code>src/runtime/agents.ts</code></a
+                ><br /><a href="src/runtime/discovery.ts"><code>src/runtime/discovery.ts</code></a>
+              </div>
+              <span
+                >Definition resolution, fail-closed parsing, bounded traversal and owned file
+                reads.</span
+              >
+            </li>
+            <li>
+              <div>
+                <a href="src/runtime/skills.ts"><code>src/runtime/skills.ts</code></a
+                ><br /><a href="src/runtime/skill-sources.ts"
+                  ><code>src/runtime/skill-sources.ts</code></a
+                ><br /><a href="src/runtime/tools.ts"><code>src/runtime/tools.ts</code></a
+                ><br /><a href="src/runtime/limits.ts"><code>src/runtime/limits.ts</code></a>
+              </div>
+              <span
+                >Selected skills, tool construction and forwarding, preparation/output limits.</span
+              >
+            </li>
+            <li>
+              <a href="src/runtime/mcp.ts"><code>src/runtime/mcp.ts</code></a
+              ><span
+                >Selected-only separate user configuration, validation and explicit environment
+                resolution.</span
+              >
+            </li>
+            <li>
+              <a href="src/session/mcp/index.ts"><code>src/session/mcp/</code></a
+              ><span
+                >Owned clients/transports, bounded HTTP I/O, direct/deferred visible tool registry
+                and schema-gated calls.</span
+              >
+            </li>
+          </ul>
+        </section>
+      </main>
+      <footer>
+        <span>Current working tree; see module READMEs for component responsibilities.</span
+        ><span>Embedded CSS + SVG · no JavaScript · optional web fonts</span>
+      </footer>
+    </div>
+  </body>
+</html>

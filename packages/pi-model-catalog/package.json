@@ -1,0 +1,49 @@
+{
+  "name": "@korioinc/pi-model-catalog",
+  "version": "0.1.0",
+  "description": "Cache custom provider model catalogs and refresh them with /model refresh",
+  "keywords": [
+    "catalog",
+    "models",
+    "pi",
+    "pi-package",
+    "provider"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/korioinc/pi-agent-extensions.git",
+    "directory": "packages/pi-model-catalog"
+  },
+  "files": [
+    "index.ts",
+    "catalog.ts",
+    "cache.ts",
+    "thinking.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=1.4.0",
+    "@earendil-works/pi-coding-agent": ">=1.4.0",
+    "@earendil-works/pi-tui": ">=1.4.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

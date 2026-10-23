@@ -1,0 +1,45 @@
+{
+  "name": "@korioinc/pi-skill",
+  "version": "0.1.0",
+  "description": "Codex-style $skill-name invocation anywhere in a pi prompt",
+  "keywords": [
+    "codex",
+    "pi",
+    "pi-package",
+    "skill",
+    "skills"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/korioinc/pi-agent-extensions.git",
+    "directory": "packages/pi-skill"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "prepack": "npm run check"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.4.0",
+    "@earendil-works/pi-tui": ">=1.4.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

@@ -1,0 +1,49 @@
+{
+  "name": "pi-agent-extensions",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pi coding agent packages by korioinc",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/korioinc/pi-agent-extensions.git"
+  },
+  "workspaces": [
+    "packages/pi-service-tier",
+    "packages/pi-skill",
+    "packages/pi-model-catalog",
+    "packages/pi-subagents"
+  ],
+  "type": "module",
+  "scripts": {
+    "check:versions": "node scripts/check-workspace-versions.mjs",
+    "format": "oxfmt .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint --deny-warnings .",
+    "lint:fix": "oxlint --fix .",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "node --test scripts/*.test.mjs && npm test --workspaces --if-present",
+    "check": "npm run check:versions && npm run format:check && npm run lint && npm run typecheck && npm test",
+    "pack:check": "npm pack --workspaces --dry-run"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
+    "@types/node": "^24.0.0",
+    "oxfmt": "^0.72.0",
+    "oxlint": "^1.87.0",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "pi": {
+    "extensions": [
+      "./packages/pi-service-tier/index.ts",
+      "./packages/pi-skill/index.ts",
+      "./packages/pi-model-catalog/index.ts",
+      "./packages/pi-subagents/index.ts"
+    ]
+  }
+}
