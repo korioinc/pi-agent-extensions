@@ -130,13 +130,15 @@ npm requires a package to exist before its trusted publisher can be configured. 
 
 1. Log in with an npm account that can publish under `@korioinc`, using `npm login` and the requested browser/2FA authentication.
 2. Run `npm run check` and `npm run pack:check` from the repository root.
-3. Create the selected package's tarball with `npm pack --workspace @korioinc/pi-subagents` and inspect its contents.
-4. Stage that tarball with `npm stage publish ./korioinc-pi-subagents-0.1.0.tgz --access public`.
+3. In a temporary directory, create a bootstrap `package.json` with the selected package name and version `0.0.0-bootstrap`. Keep the repository's actual release version unchanged.
+4. From that temporary directory, run `npm stage publish --tag bootstrap --access public`. Keep this staging entry pending; never approve it. Use `npm stage list @korioinc/pi-subagents` to record its exact stage ID.
 5. Configure its trusted publisher with the values above. The CLI equivalent is `npm trust github @korioinc/pi-subagents --repo korioinc/pi-agent-extensions --file publish.yml --env production --allow-publish --yes`.
-6. Use `npm stage list @korioinc/pi-subagents` to find the staged version. Remove that staging entry with `npm stage reject <stage-id>` before the workflow publishes the same version; npm does not allow a staged and published version to share the same version number.
-7. Merge the release commit into `main` and confirm that CI passes.
-8. Validate the selected tag with `npm run check:release -- pi-subagents-0.1.0`.
-9. Create the tag with `git tag pi-subagents-0.1.0`, then push it with `git push origin pi-subagents-0.1.0`.
+6. Merge the release commit into `main` and confirm that CI passes.
+7. Validate the selected tag with `npm run check:release -- pi-subagents-0.1.0`.
+8. Create the tag with `git tag pi-subagents-0.1.0`, then push it with `git push origin pi-subagents-0.1.0`.
+9. After the workflow successfully publishes `0.1.0`, reject only the recorded bootstrap stage with `npm stage reject <stage-id>`. Verify that the real published version and trusted publisher remain available.
+
+Do not stage the actual release version during bootstrap: npm reserves staged version numbers and cannot publish that same version through the workflow. Do not reject the last bootstrap stage before the first real publication; npm can remove the new package and its trusted publisher when no published version remains.
 
 Repeat the registration and trusted-publisher setup for each new package. Push package tags separately so each receives its own workflow run. Later releases need only their version update and package tag.
 
