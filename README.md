@@ -88,7 +88,7 @@ See the [pi package documentation](https://github.com/earendil-works/pi/blob/mai
 ## GitHub Actions
 
 - `ci.yml`: Installs dependencies and runs all checks, including packaging checks, on pull requests and pushes to `main`.
-- `publish.yml`: On `pi-*-*` tag pushes, resolves exactly one workspace from the package name and version, checks the repository, then packs and publishes only that package.
+- `publish.yml`: On `pi-*-*` tag pushes, resolves exactly one workspace from the package name and version, checks the repository, then packs and publishes only that package through npm trusted publishing (OIDC). Manual runs accept an existing package tag and use the latest workflow on `main`.
 
 Pushing code to `main` alone does not publish packages.
 Tags use `<unscoped-package-name>-<version>`, without a `v` before the version. The version must match that package's `package.json` in the tagged commit. The root and other workspace versions do not need to match.
@@ -107,22 +107,42 @@ Unknown packages, mismatched versions, ambiguous tags and private packages fail 
 Files published to npm are public even when this GitHub repository is private.
 Review each package's `files` list and the output of `npm run pack:check` before publishing.
 
+### Publishing authentication
+
+GitHub Actions uses the `production` environment and `id-token: write` permission. npm exchanges the workflow's OIDC identity for publish access. No `NPM_TOKEN` secret is used. This public source repository also allows npm to generate provenance automatically.
+
+Configure a trusted publisher for each npm package with these exact values:
+
+| Setting           | Value                 |
+| ----------------- | --------------------- |
+| Provider          | GitHub Actions        |
+| Organization      | `korioinc`            |
+| Repository        | `pi-agent-extensions` |
+| Workflow filename | `publish.yml`         |
+| Environment       | `production`          |
+| Allowed action    | `npm publish`         |
+
+See [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) for setup and authentication requirements. A newly created trust configuration must complete its first successful publish within two days.
+
 ### First release
 
-1. Obtain permission to publish to the `korioinc` organization or scope on npm.
-2. Create a granular access token that can create and write packages in that scope. Enable **Bypass 2FA** for automated publishing.
-3. Add the token as a repository secret named `NPM_TOKEN` under **Settings → Secrets and variables → Actions** on GitHub.
-4. Merge this configuration and `package-lock.json` into `main`.
-5. Confirm that CI passes.
-6. Validate the selected package tag, for example `npm run check:release -- pi-subagents-0.1.0`.
-7. Create its first release tag with `git tag pi-subagents-0.1.0`.
-8. Publish only that package by pushing the tag with `git push origin pi-subagents-0.1.0`.
+npm requires a package to exist before its trusted publisher can be configured. Use npm 11.15.0 or later for the `npm stage` and `npm trust` commands below. For a new package, use an interactive npm login and [staged publishing](https://docs.npmjs.com/staged-publishing/) to register it first. Staging creates npm's public `0.0.0-stage` placeholder; it does not publish the staged source version.
 
-Repeat with each package's own tag when it is ready for its first release. The first successful publish creates that npm package; no package page needs to be created in advance.
+1. Log in with an npm account that can publish under `@korioinc`, using `npm login` and the requested browser/2FA authentication.
+2. Run `npm run check` and `npm run pack:check` from the repository root.
+3. Create the selected package's tarball with `npm pack --workspace @korioinc/pi-subagents` and inspect its contents.
+4. Stage that tarball with `npm stage publish ./korioinc-pi-subagents-0.1.0.tgz --access public`.
+5. Configure its trusted publisher with the values above. The CLI equivalent is `npm trust github @korioinc/pi-subagents --repo korioinc/pi-agent-extensions --file publish.yml --env production --allow-publish --yes`.
+6. Use `npm stage list @korioinc/pi-subagents` to find the staged version. Remove that staging entry with `npm stage reject <stage-id>` before the workflow publishes the same version; npm does not allow a staged and published version to share the same version number.
+7. Merge the release commit into `main` and confirm that CI passes.
+8. Validate the selected tag with `npm run check:release -- pi-subagents-0.1.0`.
+9. Create the tag with `git tag pi-subagents-0.1.0`, then push it with `git push origin pi-subagents-0.1.0`.
 
-Only the publish step in `publish.yml` uses the token. Replace the secret when the token expires.
-Provenance attestations are disabled because this GitHub repository is private.
-After the first release, you can configure [npm trusted publishing](https://docs.npmjs.com/trusted-publishers/) and update the workflow to publish without a token.
+Repeat the registration and trusted-publisher setup for each new package. Push package tags separately so each receives its own workflow run. Later releases need only their version update and package tag.
+
+### Pi package catalog
+
+Each package includes the `pi-package` keyword and an explicit `pi.extensions` entrypoint. These make public npm releases eligible for the [Pi package catalog](https://pi.dev/packages); catalog indexing may lag behind npm publication. Optional preview images and videos are not required.
 
 ### Subsequent releases
 

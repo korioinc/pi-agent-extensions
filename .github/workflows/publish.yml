@@ -4,22 +4,31 @@ on:
   push:
     tags:
       - "pi-*-*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Package tag to publish, for example pi-subagents-0.1.1"
+        required: true
+        type: string
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
-  group: npm-release-${{ github.ref }}
+  group: npm-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: production
     timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           persist-credentials: false
 
       - name: Set up Node.js
@@ -29,9 +38,14 @@ jobs:
           registry-url: "https://registry.npmjs.org"
           package-manager-cache: false
 
+      - name: Update npm for trusted publishing
+        run: npm install --global npm@^11.6.2
+
       - name: Resolve release package
         id: release
-        run: npm run check:release -- "$GITHUB_REF_NAME"
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: npm run check:release -- "$RELEASE_TAG"
 
       - name: Install dependencies
         run: npm ci
@@ -47,9 +61,4 @@ jobs:
       - name: Publish package
         env:
           RELEASE_WORKSPACE: ${{ steps.release.outputs.workspace }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          # npm provenance requires a public source repository.
-          NPM_CONFIG_PROVENANCE: "false"
-        run: |
-          : "${NODE_AUTH_TOKEN:?Set the NPM_TOKEN repository secret before publishing}"
-          npm publish --workspace="$RELEASE_WORKSPACE" --access public
+        run: npm publish --workspace="$RELEASE_WORKSPACE" --access public
