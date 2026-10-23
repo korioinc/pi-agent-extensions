@@ -99,7 +99,7 @@ For example, the initial package tags are:
 | ---------------------------- | ------------------------ |
 | `@korioinc/pi-service-tier`  | `pi-service-tier-0.1.0`  |
 | `@korioinc/pi-skill`         | `pi-skill-0.1.0`         |
-| `@korioinc/pi-model-catalog` | `pi-model-catalog-0.1.0` |
+| `@korioinc/pi-model-catalog` | `pi-model-catalog-0.1.1` |
 | `@korioinc/pi-subagents`     | `pi-subagents-0.1.0`     |
 
 Unknown packages, mismatched versions, ambiguous tags and private packages fail validation before dependencies are installed or publishing starts. Old `v0.1.0` and `pi-subagents-v0.1.0` tags are not supported. GitHub Releases are optional and are not created by this workflow.

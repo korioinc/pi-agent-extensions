@@ -1,6 +1,6 @@
 {
   "name": "@korioinc/pi-model-catalog",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Cache custom provider model catalogs and refresh them with /model refresh",
   "keywords": [
     "catalog",
