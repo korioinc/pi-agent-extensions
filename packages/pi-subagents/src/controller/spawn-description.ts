@@ -1,9 +1,7 @@
 import { SPAWN_DESCRIPTION } from "../instructions/parent.ts";
-import { boundedText } from "../runtime/limits.ts";
 import type { AgentCatalog } from "./catalog.ts";
 
 const CATALOG_BYTES = 8 * 1024;
-const DESCRIPTION_BYTES = 512;
 const MAX_AGENTS = 20;
 
 type Catalog = Awaited<ReturnType<AgentCatalog["list"]>>;
@@ -23,9 +21,9 @@ export function spawnDescription(catalog?: Catalog): string {
       .trim();
     const entry = JSON.stringify({
       name: agent.name,
-      description: boundedText(description, DESCRIPTION_BYTES),
+      description,
     });
-    // Keep canonical names intact; omit complete rows rather than inventing truncated IDs.
+    // Keep names and descriptions intact; omit complete rows when the catalog is full.
     if (rows.length >= MAX_AGENTS || bytes + Buffer.byteLength(entry) + 2 > CATALOG_BYTES) {
       omitted++;
       continue;
