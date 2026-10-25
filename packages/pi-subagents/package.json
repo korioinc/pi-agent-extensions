@@ -1,6 +1,6 @@
 {
   "name": "@korioinc/pi-subagents",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Markdown-configured subagents for Pi with parent model authentication and tool delegation",
   "keywords": [
     "pi",
