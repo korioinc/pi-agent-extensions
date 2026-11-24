@@ -1,6 +1,6 @@
 {
   "name": "@korioinc/pi-service-tier",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Independent Fast and Ultrafast toggles for pi, including custom provider model IDs",
   "keywords": [
     "fast",

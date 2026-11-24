@@ -1,6 +1,6 @@
 {
   "name": "@korioinc/pi-skill",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex-style $skill-name invocation anywhere in a pi prompt",
   "keywords": [
     "codex",
