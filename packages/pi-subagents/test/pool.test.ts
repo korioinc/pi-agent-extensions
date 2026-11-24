@@ -3,6 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setImmediate as nextTurn } from "node:timers/promises";
 import { RunnerPool, type RunControl, type Settlement } from "../src/runner-pool/index.ts";
 import { LIMITS } from "../src/runtime/limits.ts";
 
@@ -52,64 +53,6 @@ test("same-agent runs do not couple cancellation or grant name-based control", a
   release.resolve();
   await Promise.all(runs.map((run) => run.result));
   assert.deepEqual(effects, [1], "only the run selected by UUID loses authority to continue");
-  await pool.drain();
-});
-
-test("handoff reads require safe terminal ownership and copies survive source expiry", async (t) => {
-  t.mock.timers.enable({ apis: ["Date", "setTimeout"] });
-  const pool = new RunnerPool();
-  const cleanup = gate<Settlement>();
-  let control!: RunControl;
-  const run = admitted(
-    pool.submit(origin, async (value) => {
-      control = value;
-      control.running();
-      control.partial({ type: "replace", text: success.text });
-      return cleanup.promise;
-    }),
-  );
-  t.after(() => cleanup.resolve(success));
-  await Promise.resolve();
-  const visible = (actor: typeof caller) => JSON.stringify(pool.handoff(actor, run.runId));
-  assert.equal(
-    visible(caller).includes(success.text),
-    false,
-    "active partial work cannot be inherited",
-  );
-  control.settling();
-  assert.equal(visible(caller).includes(success.text), false, "cleanup must finish before handoff");
-  pool.cancel(caller, run.runId);
-  t.mock.timers.tick(LIMITS.graceMs);
-  assert.equal(
-    visible(caller).includes(success.text),
-    false,
-    "blocked cleanup cannot authorize a source read",
-  );
-  cleanup.resolve(success);
-  await run.result;
-  for (const foreign of [
-    { sessionId: "foreign", branch: caller.branch },
-    { sessionId: caller.sessionId, branch: new Set<string>() },
-  ])
-    assert.equal(
-      visible(foreign).includes(success.text),
-      false,
-      "a source from another origin cannot be read",
-    );
-  const snapshot = pool.handoff(caller, run.runId);
-  if ("rejection" in snapshot) throw new Error("Owned source unavailable");
-  assert.equal(snapshot.text, success.text, "safe owner handoff retains the selected evidence");
-  t.mock.timers.tick(LIMITS.retentionMs);
-  assert.equal(
-    visible(caller).includes(success.text),
-    false,
-    "expired sources cannot authorize new reads",
-  );
-  assert.equal(
-    snapshot.text,
-    success.text,
-    "expiry cannot revoke an already accepted value snapshot",
-  );
   await pool.drain();
 });
 
@@ -556,6 +499,46 @@ test("admission deadlines stop new effects even before timer callbacks run", asy
   }
 });
 
+test("time spent revalidating authority cannot admit an effect after expiry", async (t) => {
+  let now = performance.now();
+  t.mock.method(performance, "now", () => now);
+  const pool = new RunnerPool();
+  let deadline: number | undefined;
+  let forbiddenEffect = false;
+  const run = admitted(
+    pool.submit(
+      origin,
+      async (control) => {
+        control.running();
+        deadline = control.deadline;
+        try {
+          control.check();
+          control.safeguardSignal.throwIfAborted();
+          forbiddenEffect = true;
+        } catch {
+          // Expiry during a synchronous authority check must still close ordinary work.
+        }
+        control.settling();
+        return { outcome: "failed", text: "" };
+      },
+      undefined,
+      undefined,
+      undefined,
+      {
+        authorize: () => true,
+        check: () => {
+          if (deadline !== undefined) now = deadline;
+        },
+        commit: () => undefined,
+        afterSafe: async (value) => value,
+      },
+    ),
+  );
+  await run.result;
+  assert.equal(forbiddenEffect, false, "an expired authorization check cannot grant a new effect");
+  await pool.drain();
+});
+
 test("startup ends at running or settling without renewing invocation or stop grace", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   for (const stage of ["running", "settling"] as const) {
@@ -630,6 +613,49 @@ test("startup expiry retains ownership until preparation has safely stopped", as
   await run.result;
   await pool.drain();
 });
+
+for (const arrival of ["executor", "finalization"] as const) {
+  test(`known unsafe cleanup during ${arrival} cannot release ownership`, async (t) => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const pool = new RunnerPool(1);
+    let control!: RunControl;
+    pool.submit(
+      origin,
+      async (value) => {
+        control = value;
+        if (arrival === "executor") control.observation({ cleanupUnsafe: true });
+        return success;
+      },
+      undefined,
+      undefined,
+      undefined,
+      {
+        authorize: () => true,
+        check() {},
+        commit: () => undefined,
+        afterSafe: async (settlement) => {
+          if (arrival === "finalization")
+            queueMicrotask(() =>
+              queueMicrotask(() => control.observation({ cleanupUnsafe: true })),
+            );
+          return settlement;
+        },
+      },
+    );
+    await nextTurn();
+    let forbiddenEffect = false;
+    pool.submit(origin, async () => {
+      forbiddenEffect = true;
+      return success;
+    });
+    await nextTurn();
+    assert.equal(
+      forbiddenEffect,
+      false,
+      "known unsafe ownership cannot authorize replacement work",
+    );
+  });
+}
 
 test("unexpected executor rejection cannot complete or release unresolved ownership", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -716,4 +742,163 @@ test("a changing error message cannot prevent cancellation after executor failur
 
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(signal?.aborted, true, "executor failure must cancel its owned work");
+});
+
+test("pool pushes progress for model selection, active tools, queued slots, stopping and cleanup stages", async () => {
+  const activityNotifications: number[] = [];
+  const pool = new RunnerPool(undefined, undefined, () => {
+    activityNotifications.push(activityNotifications.length + 1);
+  });
+  const updates: Array<{
+    phase: string;
+    model?: string;
+    stage: string;
+    queuedTools?: number;
+    activeToolNames?: string[];
+  }> = [];
+  const run = admitted(
+    pool.submit(
+      origin,
+      async (control) => {
+        control.observation({
+          selection: {
+            model: "anthropic/claude-sonnet-4-5",
+            modelSource: "agent",
+            thinkingLevel: "off",
+            thinkingSource: "parent",
+          },
+        });
+        control.running();
+        control.activity({ type: "started", id: "t1", name: "read" });
+        // Same-name concurrent tool should not push a duplicate progress event.
+        control.activity({ type: "started", id: "t2", name: "read" });
+        control.activity({ type: "started", id: "t3", name: "grep" });
+        control.diagnostics({
+          pendingTools: 3,
+          pendingTransports: 0,
+          activeTools: 2,
+          queuedTools: 1,
+        });
+        // Active tool changes while queued should not spam progress while tool-slot wait dominates.
+        control.activity({ type: "returned", id: "t3", name: "grep" });
+        control.diagnostics({
+          pendingTools: 2,
+          pendingTransports: 0,
+          activeTools: 2,
+          queuedTools: 0,
+        });
+        control.activity({ type: "returned", id: "t1", name: "read" });
+        control.activity({ type: "returned", id: "t2", name: "read" });
+        control.stop("cancelled");
+        control.diagnostics({ stage: "abort" });
+        control.settling();
+        control.diagnostics({ stage: "operations" });
+        control.diagnostics({ stage: "mcp_close" });
+        control.diagnostics({ stage: "finished" });
+        return { outcome: "cancelled", text: "" };
+      },
+      undefined,
+      (progress) => {
+        updates.push({
+          phase: progress.phase,
+          model: progress.model,
+          stage: progress.diagnostics.stage,
+          queuedTools: progress.diagnostics.queuedTools,
+          activeToolNames: progress.diagnostics.activeToolNames,
+        });
+      },
+      { agent: "reviewer" },
+    ),
+  );
+  const settled = await run.result;
+  assert.equal(settled.model, "anthropic/claude-sonnet-4-5");
+  assert.equal(settled.diagnostics.activeToolNames, undefined);
+  assert.deepEqual(updates, [
+    {
+      phase: "preparing",
+      model: undefined,
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+    {
+      phase: "preparing",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+    {
+      phase: "running",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+    {
+      phase: "running",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: ["read"],
+    },
+    {
+      phase: "running",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: ["read", "grep"],
+    },
+    {
+      phase: "running",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 1,
+      activeToolNames: ["read", "grep"],
+    },
+    {
+      phase: "running",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: ["read"],
+    },
+    {
+      phase: "running",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+    {
+      phase: "cancelling",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "admitted",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+    {
+      phase: "settling",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "abort",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+    {
+      phase: "settling",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "operations",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+    {
+      phase: "settling",
+      model: "anthropic/claude-sonnet-4-5",
+      stage: "mcp_close",
+      queuedTools: 0,
+      activeToolNames: undefined,
+    },
+  ]);
+  assert(activityNotifications.length > 0, "pool must notify activity listeners on state changes");
+  await pool.drain();
 });

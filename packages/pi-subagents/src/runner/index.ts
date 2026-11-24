@@ -1,5 +1,5 @@
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import type { RunControl, Settlement } from "../runner-pool/index.ts";
+import type { RunControl, RunStage, Settlement } from "../runner-pool/index.ts";
 import { prepareInvocation, type ResearchSource } from "../runtime/index.ts";
 import {
   Preparation,
@@ -9,9 +9,9 @@ import {
 import { ChildSession, type FollowupDelivery } from "../session/index.ts";
 import { Budget } from "./budget.ts";
 import { LIMITS } from "../runtime/limits.ts";
-import type { HandoffReference } from "../runtime/handoff.ts";
 import { cleanupFailure } from "./cleanup.ts";
 import { safeErrorText } from "../runtime/errors.ts";
+import { classifyFailure } from "./failure.ts";
 
 /** The caller retains native history; each invocation still owns a fresh runtime and budget. */
 export interface RunnerIngress {
@@ -31,7 +31,7 @@ export interface RunnerContinuation {
 /** Coordinates preparation, execution and every owner before reporting safe settlement. */
 export async function runResearch(
   source: ResearchSource,
-  { task, agent, handoff }: { task: string; agent: string; handoff?: HandoffReference },
+  { task, agent }: { task: string; agent: string },
   control: RunControl,
   continuation?: RunnerContinuation,
 ): Promise<Settlement> {
@@ -50,9 +50,16 @@ export async function runResearch(
   let cleanupError: string | undefined;
   let unsafeCleanup: Error | undefined;
   let outcome: Settlement["outcome"] = "failed";
+  let configurationFailure = false;
+  let stage: RunStage = "admitted";
+  let failureStage: RunStage | undefined;
+  const step = (value: RunStage) => {
+    stage = value;
+    control.diagnostics({ stage: value });
+  };
   try {
     budget.check();
-    control.diagnostics({ stage: "preparation" });
+    step("preparation");
     const captureBound = (includeParentPrompt: boolean) => {
       budget.check();
       const captured = source.capture(includeParentPrompt);
@@ -64,14 +71,15 @@ export async function runResearch(
     const host = source.scope();
     const preparation = new Preparation(control.signal, control.startupDeadline);
     const { config, fingerprint: epoch } = await budget.track(
-      prepareInvocation(host, task, agent, preparation, captureBound, handoff),
+      prepareInvocation(host, task, agent, preparation, captureBound, control.executionLimits),
       "transport",
     );
     preparation.check();
     budget.check();
     control.observation({ selection: config.selection });
+    control.observation({ executionLimits: config.executionLimits });
     budget.configureModelTokens(config.maxModelTokens);
-    control.diagnostics({ stage: "session_start" });
+    step("session_start");
     const history = continuation?.history ?? SessionManager.inMemory(config.cwd);
     child = new ChildSession(
       {
@@ -82,16 +90,23 @@ export async function runResearch(
         signal: control.signal,
         safeguardSignal: control.safeguardSignal,
         workSignal: control.workSignal,
+        safeguard: (reason) => control.safeguard(reason),
         wrapTools: (tools, codemode) => budget.tools(tools, codemode),
         check: () => budget.check(),
+        checkFast: () => budget.checkFast(),
         checkHistory,
         checkStartup: () => {
           budget.check();
           preparation.check();
         },
-        request: (toolResultContinuation) => {
+        cleanupUnsafe: () => control.observation({ cleanupUnsafe: true }),
+        request: (kind) => {
           checkHistory();
-          budget.request(toolResultContinuation);
+          return budget.request(kind);
+        },
+        modelFailure: (model) => {
+          failureStage ??= stage;
+          control.observation({ modelFailure: model, failureStage });
         },
         takeWrapUpNotice: () => budget.takeWrapUpNotice(),
         takeMessages: () => control.takeMessages(),
@@ -131,13 +146,14 @@ export async function runResearch(
                 agent,
                 preparation,
                 captureBound,
-                handoff,
+                control.executionLimits,
               );
               budget.check();
               return session.accepting() && candidate === epoch;
             })().catch((error: unknown) => {
               if (error instanceof PreparationSafetyError) {
                 unsafeCleanup ??= error;
+                control.observation({ cleanupUnsafe: true });
                 control.stop("preparation_cleanup_failed");
               }
               throw error;
@@ -146,7 +162,7 @@ export async function runResearch(
           ),
       });
     }
-    control.diagnostics({ stage: "execution" });
+    step("execution");
     control.running();
     try {
       await child.prompt();
@@ -156,30 +172,43 @@ export async function runResearch(
     if (control.safeguardSignal.aborted && !control.signal.aborted) {
       const reason = `limit_exceeded: ${safeErrorText(control.safeguardSignal.reason)}`;
       failure = reason;
-      control.diagnostics({ stage: "safeguard_finish" });
+      failureStage ??= stage;
+      step("safeguard_finish");
       try {
         await child.finishWork();
         await budget.drain();
       } catch (error) {
         unsafeCleanup ??= cleanupFailure(error, "Safeguard cleanup failed.");
+        control.observation({ cleanupUnsafe: true });
         control.stop("safeguard_cleanup_failed");
         throw error;
       }
       budget.check();
       if (control.beginSummary()) {
         budget.beginSummary();
-        control.diagnostics({ stage: "safeguard_summary" });
+        step("safeguard_summary");
         const summarized = await child.summarize(reason);
         control.finishSummary(summarized);
       }
     } else failure = child.snapshot().error;
+    if (failure) failureStage ??= stage;
     if (control.signal.aborted) {
       const reason = safeErrorText(control.signal.reason);
       outcome = reason === "cancelled" || reason === "shutdown" ? "cancelled" : "failed";
       failure ??= reason;
     } else outcome = failure ? "failed" : "succeeded";
   } catch (error) {
-    if (error instanceof PreparationSafetyError) unsafeCleanup ??= error;
+    failureStage ??= stage;
+    configurationFailure =
+      failureStage === "preparation" &&
+      !control.signal.aborted &&
+      !control.safeguardSignal.aborted &&
+      !(error instanceof PreparationLimitError) &&
+      !(error instanceof PreparationSafetyError);
+    if (error instanceof PreparationSafetyError) {
+      unsafeCleanup ??= error;
+      control.observation({ cleanupUnsafe: true });
+    }
     if (error instanceof PreparationLimitError) control.stop(`limit_exceeded: ${error.message}`);
     failure ??= child?.snapshot().error ?? safeErrorText(error);
     const reason = safeErrorText(control.signal.reason);
@@ -188,33 +217,51 @@ export async function runResearch(
         ? "cancelled"
         : "failed";
   } finally {
-    control.diagnostics({ stage: "abort" });
+    step("abort");
     control.settling();
     // A failed owner cannot prevent the other owners from attempting cleanup.
     const cleanup = async (operation: () => void | Promise<unknown>) => {
       try {
         await operation();
       } catch (error) {
+        failureStage ??= stage;
         const normalized = cleanupFailure(error, "Child resource cleanup failed.");
         unsafeCleanup ??= normalized;
+        control.observation({ cleanupUnsafe: true });
         cleanupError = [cleanupError, normalized.message].filter(Boolean).join("; ");
       }
     };
     await cleanup(() => child?.abort());
-    control.diagnostics({ stage: "operations" });
+    step("operations");
     await cleanup(() => budget.drain());
-    await cleanup(() => child?.close((stage) => control.diagnostics({ stage })));
+    await cleanup(() => child?.close(step));
   }
   const result = child?.snapshot();
   cleanupError = [cleanupError, result?.cleanupError].filter(Boolean).join("; ") || undefined;
   if (unsafeCleanup !== undefined) {
-    control.diagnostics({ stage: "cleanup_unconfirmed" });
+    step("cleanup_unconfirmed");
     throw new Error(
       `${failure ?? "Execution stopped"}; resource cleanup is unconfirmed. ${cleanupError ?? ""}`,
       { cause: unsafeCleanup },
     );
   }
   if (cleanupError && outcome === "succeeded") outcome = "failed";
-  control.diagnostics({ stage: "finished" });
-  return { outcome, text: result?.text ?? "", error: failure, cleanupError, usage: result?.usage };
+  const diagnostic = classifyFailure({
+    outcome,
+    stage: failureStage ?? stage,
+    stopReason: control.signal.reason,
+    safeguardReason: control.safeguardSignal.reason,
+    model: result?.modelFailure,
+    toolEffects: budget.toolEffects,
+    configurationFailure,
+  });
+  step("finished");
+  return {
+    outcome,
+    text: result?.text ?? "",
+    error: failure,
+    cleanupError,
+    usage: result?.usage,
+    ...(diagnostic ? { failure: diagnostic } : {}),
+  };
 }

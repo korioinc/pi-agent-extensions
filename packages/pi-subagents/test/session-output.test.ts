@@ -179,7 +179,40 @@ test("a successful handoff replaces response evidence only when execution remain
   assert.equal(output.error, undefined, "successful replacement commits response status with text");
 });
 
-test("ordinary publication failure stays recorded after later model failure", async (t) => {
+test("a recovered response clears model failure without erasing earlier effects", (t) => {
+  const output = new AssistantOutput(() => {});
+  t.after(() => output.close());
+  output.observe({
+    type: "message_end",
+    message: {
+      ...message("Recorded invoice 17."),
+      stopReason: "error",
+      errorMessage: "terminated",
+    },
+  });
+  output.observe({ type: "message_start", message: message("") });
+  assert.equal(output.error, "terminated", "starting another attempt is not recovery");
+  output.observe({ type: "message_end", message: message("Invoice 17 verified.") });
+  assert.equal(output.error, undefined, "a successful response must recover the model failure");
+  assert.equal(output.text, "Invoice 17 verified.");
+});
+
+test("exhausted responses retain the final model failure instead of an earlier transient error", (t) => {
+  const output = new AssistantOutput(() => {});
+  t.after(() => output.close());
+  output.observe({
+    type: "message_end",
+    message: { ...message("Partial evidence"), stopReason: "error", errorMessage: "terminated" },
+  });
+  output.observe({
+    type: "message_end",
+    message: { ...message(""), stopReason: "error", errorMessage: "503 no available server" },
+  });
+  assert.equal(output.error, "503 no available server");
+  assert.equal(output.text, "Partial evidence", "failed recovery must preserve useful evidence");
+});
+
+test("ordinary publication failure stays recorded after model failure and recovery", async (t) => {
   const output = new AssistantOutput(() => {
     throw new Error("Publisher unavailable");
   });
@@ -199,6 +232,27 @@ test("ordinary publication failure stays recorded after later model failure", as
   assert.equal(
     output.error,
     publicationFailure,
-    "later failures must not conceal the first failure",
+    "later failures must not conceal the publication failure",
   );
+  output.observe({ type: "message_end", message: message("") });
+  assert.equal(output.error, publicationFailure, "model recovery cannot repair failed publication");
+});
+
+test("a later successful handoff cannot clear an ordinary publication failure", async (t) => {
+  let unavailable = true;
+  const output = new AssistantOutput(() => {
+    if (unavailable) throw new Error("Publisher unavailable");
+  });
+  t.after(() => output.close());
+  output.observe({ type: "message_end", message: message("Committed work") });
+  const failure = output.error;
+  assert(failure);
+  unavailable = false;
+  await output.replaceWith(
+    async () => {
+      output.observe({ type: "message_end", message: message("Verified handoff") });
+    },
+    () => true,
+  );
+  assert.equal(output.error, failure, "a successful replacement does not repair earlier delivery");
 });

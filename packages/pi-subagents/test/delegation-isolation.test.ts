@@ -20,10 +20,10 @@ import {
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import { registerSubagents } from "../src/controller/index.ts";
-import { SPAWN_GUIDELINES } from "../src/instructions/parent.ts";
+import { SUBAGENT_GUIDELINES } from "../src/instructions/parent.ts";
 
 for (const mode of ["append", "replace"]) {
-  test(`${mode} children cannot receive parent delegation instructions or start nested work`, async (t) => {
+  test(`subagent ${mode} children cannot receive parent delegation instructions or start nested work`, async (t) => {
     const root = await mkdtemp(join(tmpdir(), "pi-parent-only-delegation-"));
     const previous = process.env.PI_CODING_AGENT_DIR;
     process.env.PI_CODING_AGENT_DIR = root;
@@ -80,7 +80,7 @@ for (const mode of ["append", "replace"]) {
         const system = getCurrentSystemMessage(context.messages);
         const prompt = system ? getSystemMessageText(system) : "";
         if (isParent) {
-          parentReceivedGuidance = SPAWN_GUIDELINES.every((rule) => prompt.includes(rule));
+          parentReceivedGuidance = SUBAGENT_GUIDELINES.every((rule) => prompt.includes(rule));
         } else {
           if (revoked) workAfterRevocation = true;
           childPrompts.push({ prompt, system: JSON.stringify(system) });
@@ -100,10 +100,10 @@ for (const mode of ["append", "replace"]) {
                   {
                     type: "toolCall",
                     id: `${isParent ? "parent" : "child"}-${request}`,
-                    name: refresh ? "list_agents" : "spawn_agent",
+                    name: refresh ? "list_agents" : "subagent",
                     arguments: refresh
                       ? {}
-                      : { agent: "worker", task: "Complete only this assignment" },
+                      : { agent: "worker", handoff: "Complete only this assignment" },
                   },
                 ]
               : [{ type: "text", text: "Finished" }],
@@ -118,7 +118,11 @@ for (const mode of ["append", "replace"]) {
               cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
             },
           };
-          stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
+          stream.push({
+            type: "done",
+            reason: message.stopReason as "stop" | "toolUse",
+            message,
+          });
           stream.end();
         });
         return stream;
@@ -157,9 +161,9 @@ for (const mode of ["append", "replace"]) {
       sessionManager: SessionManager.inMemory(root),
       resourceLoader: loader,
       tools: [
-        "spawn_agent",
+        "subagent",
+        "followup_task",
         "list_agents",
-        "subagent_preflight",
         "subagent_inspect",
         "interrupt_agent",
         "send_message",
@@ -173,7 +177,7 @@ for (const mode of ["append", "replace"]) {
       assert.ok(childRequests <= 2, "an attempted nested spawn must not start another child");
       for (const { prompt, system } of childPrompts) {
         assert.ok(
-          SPAWN_GUIDELINES.every((rule) => !prompt.includes(rule)),
+          SUBAGENT_GUIDELINES.every((rule) => !prompt.includes(rule)),
           "parent orchestration instructions must not cross the child boundary",
         );
         assert.ok(

@@ -4,20 +4,24 @@ A collection of [pi coding agent](https://github.com/earendil-works/pi) packages
 This repository uses npm workspaces. Each package has its own version and Git release tags.
 The repository root is marked `private: true` and is never published to npm.
 
+All packages require **stable Pi 1.6.0 or later** for security fixes. `pi-subagents` supports the 1.x line only. Upgrade the Pi host before loading these extensions; installing an extension does not update Pi.
+
 ## Packages
 
-| Package                                                     | Description                                                                    |
-| ----------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| [`@korioinc/pi-service-tier`](./packages/pi-service-tier)   | Independent Fast and Ultrafast toggles with custom provider model matching     |
-| [`@korioinc/pi-skill`](./packages/pi-skill)                 | Inline `$skill-name` invocation with skill autocomplete and collapsible blocks |
-| [`@korioinc/pi-model-catalog`](./packages/pi-model-catalog) | Load custom provider model catalogs from URLs at startup and reload            |
-| [`@korioinc/pi-subagents`](./packages/pi-subagents)         | Markdown-defined foreground subagents with selected tools and skills           |
+| Package                                                                   | Description                                                                     |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| [`@korioinc/pi-service-tier`](./packages/pi-service-tier)                 | Independent Fast and Ultrafast toggles with custom provider model matching      |
+| [`@korioinc/pi-skill`](./packages/pi-skill)                               | Inline `$skill-name` invocation with skill autocomplete and collapsible blocks  |
+| [`@korioinc/pi-model-catalog`](./packages/pi-model-catalog)               | Load custom provider model catalogs from URLs at startup and reload             |
+| [`@korioinc/pi-subagents`](./packages/pi-subagents)                       | Markdown-defined foreground subagents with selected tools and skills            |
+| [`@korioinc/pi-project-instructions`](./packages/pi-project-instructions) | Add `AGENTS.project.md` from the trusted working directory to the system prompt |
 
 All extension packages live under `packages/`. Shared tooling and workspace configuration remain at the repository root.
 
 ```text
 packages/
   pi-model-catalog/
+  pi-project-instructions/
   pi-service-tier/
   pi-skill/
   pi-subagents/
@@ -33,6 +37,7 @@ pi install npm:@korioinc/pi-service-tier
 pi install npm:@korioinc/pi-skill
 pi install npm:@korioinc/pi-model-catalog
 pi install npm:@korioinc/pi-subagents
+pi install npm:@korioinc/pi-project-instructions
 ```
 
 ## Local development
@@ -64,7 +69,7 @@ npm run format     # Format files
 npm run lint:fix   # Apply automatic lint fixes
 ```
 
-Pi loads TypeScript source directly, so no separate build output is needed.
+Pi loads extension entrypoints from TypeScript source directly. `pi-project-instructions` also builds a JavaScript entrypoint during packaging so a Node.js SDK host can import its factory.
 `npm run check` checks formatting, linting, and types, then runs the release validation and package tests.
 `npm run pack:check` previews the files included in each package without uploading anything to npm.
 `npm run check:release -- <package-name>-<version>` validates a release tag against its workspace manifest.
@@ -81,7 +86,7 @@ Pi loads TypeScript source directly, so no separate build output is needed.
 8. Run `npm run pack:check`.
 
 Include only files needed for distribution in each package's `files` list. Update the list when adding source files.
-Declare modules provided by pi in `peerDependencies`, and manage their development versions in the root `devDependencies`.
+Declare modules provided by Pi in `peerDependencies`, and manage their development versions in the root `devDependencies`. Enforce the Pi host range before registering an extension: managed Pi installs can skip npm peer checks.
 If a package defines a `test` script, the root `npm test` command runs it automatically.
 See the [pi package documentation](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/packages.md) for packaging skills, prompts, and themes alongside extensions.
 
@@ -95,12 +100,13 @@ Tags use `<unscoped-package-name>-<version>`, without a `v` before the version. 
 
 For example, the initial package tags are:
 
-| Package                      | Tag                      |
-| ---------------------------- | ------------------------ |
-| `@korioinc/pi-service-tier`  | `pi-service-tier-0.1.0`  |
-| `@korioinc/pi-skill`         | `pi-skill-0.1.0`         |
-| `@korioinc/pi-model-catalog` | `pi-model-catalog-0.1.1` |
-| `@korioinc/pi-subagents`     | `pi-subagents-0.1.0`     |
+| Package                             | Tag                             |
+| ----------------------------------- | ------------------------------- |
+| `@korioinc/pi-service-tier`         | `pi-service-tier-0.1.0`         |
+| `@korioinc/pi-skill`                | `pi-skill-0.1.0`                |
+| `@korioinc/pi-model-catalog`        | `pi-model-catalog-0.1.1`        |
+| `@korioinc/pi-subagents`            | `pi-subagents-0.1.0`            |
+| `@korioinc/pi-project-instructions` | `pi-project-instructions-0.1.0` |
 
 Unknown packages, mismatched versions, ambiguous tags and private packages fail validation before dependencies are installed or publishing starts. Old `v0.1.0` and `pi-subagents-v0.1.0` tags are not supported. GitHub Releases are optional and are not created by this workflow.
 

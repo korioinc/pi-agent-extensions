@@ -1,6 +1,8 @@
+import satisfies from "semver/functions/satisfies.js";
 import { readFile } from "node:fs/promises";
 import type { ExtensionAPI, SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import {
+  VERSION,
   parseSkillBlock,
   SkillInvocationMessageComponent,
   stripFrontmatter,
@@ -182,6 +184,8 @@ export function createSkillAutocompleteProvider(
 }
 
 export default function piSkill(pi: ExtensionAPI) {
+  if (!satisfies(VERSION, ">=1.6.0"))
+    throw new Error(`@korioinc/pi-skill requires Pi >=1.6.0; found ${VERSION}.`);
   pi.registerMessageRenderer(SKILL_MESSAGE_TYPE, (message, { expanded, outputPad }) => {
     const text =
       typeof message.content === "string"

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
-  VERSION,
+  SettingsManager,
+  type RetrySettings,
   type ExtensionToolContext,
   type Skill,
   type ToolDefinition,
@@ -12,9 +13,13 @@ import { Preparation } from "./discovery.ts";
 import { selectTools, type ToolHost } from "./tools.ts";
 import { resolveSkills } from "./skills.ts";
 import { loadMcpServers, type McpServer } from "./mcp.ts";
-import { LIMITS } from "./limits.ts";
+import {
+  LIMITS,
+  DEFAULT_EXECUTION_LIMITS,
+  modelExecutionLimits,
+  type ExecutionLimits,
+} from "./limits.ts";
 import { SUBAGENT_ROLE_INSTRUCTIONS } from "../instructions/subagent.ts";
-import type { HandoffReference } from "./handoff.ts";
 import { inspectWorkspace, sameWorkspace, type WorkspaceIdentity } from "../workspace/identity.ts";
 
 export interface ResearchScope extends Pick<ToolHost, "cwd" | "signal"> {
@@ -24,6 +29,7 @@ export interface ResearchScope extends Pick<ToolHost, "cwd" | "signal"> {
 
 /** Borrowed catalogs are consumed synchronously to snapshot only the selected capabilities. */
 export interface ResearchHost extends ToolHost, ResearchScope {
+  retry?: Pick<RetrySettings, "enabled" | "maxRetries" | "baseDelayMs" | "maxAgentDelayMs">;
   parentPrompt?: string;
   model?: Model<Api>;
   models: readonly Model<Api>[];
@@ -44,9 +50,10 @@ export interface ResolvedSelection {
 }
 
 export interface ResearchConfig {
+  retry: ReturnType<SettingsManager["getRetrySettings"]>;
+  executionLimits: ExecutionLimits;
   cwd: string;
   task: string;
-  handoff?: HandoffReference;
   followupRequestId?: string;
   model: Model<Api>;
   thinkingLevel: ResearchHost["thinkingLevel"];
@@ -67,6 +74,7 @@ export function createResearchSource(
   ctx: ExtensionToolContext,
   metadata?: () => readonly ToolInfo[],
   capturePrompt?: (ctx: ExtensionToolContext) => string,
+  settings?: () => ReturnType<SettingsManager["getSettings"]>,
 ): ResearchSource {
   const scope = (): ResearchScope => {
     const workspace = inspectWorkspace(ctx.cwd);
@@ -87,7 +95,14 @@ export function createResearchSource(
         throw new Error("Parent policy exceeds the prompt budget.");
       const current = scope();
       const registry = ctx.modelRegistry;
+      const retry = settings?.().retry;
       return Object.freeze({
+        retry: {
+          enabled: retry?.enabled,
+          maxRetries: retry?.maxRetries,
+          baseDelayMs: retry?.baseDelayMs,
+          maxAgentDelayMs: retry?.maxAgentDelayMs,
+        },
         ...current,
         parentPrompt,
         model: ctx.model,
@@ -114,18 +129,9 @@ export function validateTask(task: string): void {
   if (!task.trim()) throw new Error("Task must not be empty.");
   if (Buffer.byteLength(task) > LIMITS.taskBytes)
     throw new Error("Task exceeds the UTF-8 input limit.");
+  if (Buffer.from(task).toString("utf8") !== task)
+    throw new Error("Task must be valid UTF-8 text.");
 }
-
-export type PreparationStage =
-  | "compatibility"
-  | "definition"
-  | "host"
-  | "model"
-  | "skills"
-  | "instructions"
-  | "tools"
-  | "mcp"
-  | "prompt";
 
 /** Prepares local configuration without reading selected skill bodies or executing capabilities. */
 export async function prepareResearch(
@@ -134,20 +140,9 @@ export async function prepareResearch(
   agent: string,
   preparation: Preparation,
   capture: ResearchSource["capture"],
-  onStage?: (stage: PreparationStage) => void,
-  handoff?: HandoffReference,
+  executionLimits: ExecutionLimits = DEFAULT_EXECUTION_LIMITS,
 ): Promise<ResearchConfig> {
   preparation.check();
-  onStage?.("compatibility");
-  const version =
-    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(
-      VERSION,
-    );
-  if (!version || Number(version[1]) !== 1 || Number(version[2]) < 4)
-    throw new Error(
-      `Unsupported Pi SDK ${VERSION}; this adapter requires a stable 1.x version >=1.4.0.`,
-    );
-  onStage?.("definition");
   if (typeof agent !== "string" || !agent.trim())
     throw new Error("Select an agent defined in your agents directory.");
   const catalog = await discoverAgents(preparation);
@@ -157,7 +152,6 @@ export async function prepareResearch(
       `Agent unavailable: ${agent}. ${catalog.diagnostics.map((item) => `${item.filePath}: ${item.error}`).join("; ")}`,
     );
   const mode = definition.promptMode;
-  onStage?.("host");
   const host = capture(mode === "append");
   preparation.check();
   if (
@@ -165,23 +159,18 @@ export async function prepareResearch(
     host.trustedProject !== scope.trustedProject
   )
     throw new Error("Parent workspace or trust changed during agent resolution.");
-  onStage?.("model");
   const selected = structuredClone(selectModel(host, definition));
   if (selected.api === "pi-virtual")
     throw new Error(
       "Select a physical model for subagents; this SDK's direct virtual routing loses router state.",
     );
-  onStage?.("tools");
   // Select and clone declarations before local tool construction or skill scanning can yield.
   const tools = await selectTools(host, definition);
   preparation.check();
-  onStage?.("instructions");
   if (definition.promptMode === "replace" && !definition.systemPrompt.trim())
     throw new Error(`Agent ${definition.name}: replace mode requires a nonempty Markdown body.`);
-  onStage?.("skills");
   const skills = await resolveSkills(definition, host.cwd, host.trustedProject, preparation);
   preparation.check();
-  onStage?.("instructions");
   let base = "";
   if (mode === "append") {
     if (!host.parentPrompt?.trim())
@@ -191,11 +180,18 @@ export async function prepareResearch(
     base = await preparation.read(definition.promptInstructionPath);
     if (!base.trim()) throw new Error("The instruction file is empty.");
   }
-  onStage?.("mcp");
-  const mcp = await loadMcpServers(definition.mcp ?? [], host.cwd, preparation);
+  const mcp = await loadMcpServers(
+    definition.mcp ?? [],
+    host.cwd,
+    preparation,
+    executionLimits.toolMs,
+  );
   preparation.check();
-  onStage?.("prompt");
-  const systemPrompt = [base, SUBAGENT_ROLE_INSTRUCTIONS].filter(Boolean).join("\n\n");
+  const effectiveLimits = modelExecutionLimits(executionLimits, selected);
+  const limitGuidance = `Execution limits: ${effectiveLimits.invocationMs} ms per invocation including preparation and waiting; ${effectiveLimits.toolMs} ms per tool or codemode script; requested output at most ${effectiveLimits.maxOutputTokens} tokens per model response (provider support varies). Plan bounded work and return verified partial progress before these limits. Limits do not grant authority or permit automatic task replay.`;
+  const systemPrompt = [base, SUBAGENT_ROLE_INSTRUCTIONS, limitGuidance]
+    .filter(Boolean)
+    .join("\n\n");
   const appendSystemPrompt = definition.systemPrompt;
   // Bound configuration inputs here; the SDK's final rendered prompt is checked at dispatch.
   const size =
@@ -216,9 +212,10 @@ export async function prepareResearch(
       "Prepared instructions, selected skill metadata and tools exceed the preparation budget.",
     );
   return Object.freeze({
+    retry: Object.freeze(SettingsManager.inMemory({ retry: host.retry }).getRetrySettings()),
+    executionLimits: effectiveLimits,
     cwd: host.cwd,
     task,
-    ...(handoff ? { handoff: Object.freeze({ ...handoff }) } : {}),
     model: selected,
     thinkingLevel: definition.thinkingLevel ?? host.thinkingLevel,
     selection: Object.freeze({
@@ -246,17 +243,9 @@ export async function prepareInvocation(
   agent: string,
   preparation: Preparation,
   capture: ResearchSource["capture"],
-  handoff?: HandoffReference,
+  executionLimits: ExecutionLimits = DEFAULT_EXECUTION_LIMITS,
 ): Promise<{ config: ResearchConfig; fingerprint: string }> {
-  const config = await prepareResearch(
-    scope,
-    task,
-    agent,
-    preparation,
-    capture,
-    undefined,
-    handoff,
-  );
+  const config = await prepareResearch(scope, task, agent, preparation, capture, executionLimits);
   const policyFingerprint = await fingerprint(config, scope.trustedProject, preparation);
   preparation.check();
   return Object.freeze({ config, fingerprint: policyFingerprint });
@@ -274,7 +263,7 @@ async function fingerprint(
         .update(await preparation.read(skill.filePath))
         .digest("hex"),
     );
-  const { task: _task, handoff: _handoff, stream: _stream, tools, ...policy } = config;
+  const { task: _task, stream: _stream, tools, ...policy } = config;
   return createHash("sha256")
     .update(
       JSON.stringify({

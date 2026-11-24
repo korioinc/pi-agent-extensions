@@ -61,7 +61,7 @@ function matchesSource(path: string, root: string, patterns?: string[]): boolean
   return included;
 }
 
-/** Fixed declaration prefixes avoid walking unrelated package trees; glob suffixes stay bounded. */
+/** Match declaration prefixes without inheriting a previously matched skill root. */
 function sourceDirectory(path: string, root: string, patterns?: string[]): boolean {
   if (patterns === undefined) return true;
   const local = relative(root, path).split(sep).join("/");
@@ -69,7 +69,16 @@ function sourceDirectory(path: string, root: string, patterns?: string[]): boole
   return patterns.some((pattern) => {
     if (/^[!+-]/.test(pattern)) return false;
     const target = pattern.replace(/^\.\//, "").replace(/\/$/, "");
-    if (target === "" || target === ".") return true;
+    if (target === "" || target === ".") return false;
+    // Brace and extglob groups can span path segments; keep their fixed prefix as the bound.
+    if (!/[{(]/.test(target)) {
+      let end = target.length;
+      while (end > 0) {
+        if (matchesGlob(local, target.slice(0, end))) return true;
+        end = target.lastIndexOf("/", end - 1);
+      }
+      return false;
+    }
     const wildcard = target.search(/[*?[{(]/);
     const prefix =
       wildcard < 0
@@ -82,6 +91,17 @@ function sourceDirectory(path: string, root: string, patterns?: string[]): boole
       local.startsWith(`${prefix}/`)
     );
   });
+}
+
+/** After these roots match, aliases have the same descendant selection rules. */
+function canReuseTraversal(patterns?: string[]): boolean {
+  if (patterns === undefined) return true;
+  if (patterns.length !== 1 || /^[!+-]/.test(patterns[0]!)) return false;
+  const prefix = patterns[0]!
+    .replace(/^\.\//, "")
+    .replace(/\/$/, "")
+    .replace(/(?:^|\/)\*{1,2}$/, "");
+  return !/[*?[{(]/.test(prefix);
 }
 
 export async function resolveSkills(
@@ -99,7 +119,15 @@ export async function resolveSkills(
   const sources = await discoverSkillSources(cwd, trustedProject, preparation);
 
   for (const source of sources) {
-    const directories = new Set<string>();
+    const ancestors = new Set<string>();
+    const visited = canReuseTraversal(source.patterns) ? new Map<string, boolean>() : undefined;
+    const directoryEntries = new Map<string, readonly Dirent[]>();
+    const declares = (path: string) =>
+      source.patterns?.some(
+        (pattern) =>
+          !/^[!+-]/.test(pattern) &&
+          sourcePatternMatches(relative(source.path, path).split(sep).join("/"), pattern),
+      ) === true;
     const load = async (path: string) => {
       if (!matchesSource(path, source.path, source.patterns)) return;
       const filePath = await preparation.io(() => fs.realpath(path));
@@ -120,87 +148,92 @@ export async function resolveSkills(
       });
     };
 
-    const walk = async (directory: string, depth: number, rootFiles: boolean): Promise<void> => {
-      if (!sourceDirectory(directory, source.path, source.patterns)) return;
+    const walk = async (
+      directory: string,
+      depth: number,
+      rootFiles: boolean,
+      inherited: boolean,
+    ): Promise<void> => {
+      const declaredRoot = declares(directory);
+      const scanning = inherited || declaredRoot;
+      if (!scanning && !sourceDirectory(directory, source.path, source.patterns)) return;
       const canonical = await preparation.io(() => fs.realpath(directory));
-      if (directories.has(canonical)) return;
-      directories.add(canonical);
-      // Separate source filters may revisit a directory; cycles never do.
-      if (depth > LIMITS.preparationDepth)
-        throw new PreparationLimitError(
-          `Preparation depth exceeds ${LIMITS.preparationDepth}: ${directory}`,
-        );
-      await preparation.visitDirectory(directory, depth);
-      const entries: Dirent[] = [];
-      for await (const entry of preparation.directory(directory)) entries.push(entry);
-      entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-      const kind = async (entry: Dirent) => {
-        if (!entry.isSymbolicLink()) return entry;
-        try {
-          return await preparation.io(() => fs.stat(join(directory, entry.name)));
-        } catch (error) {
-          if (
-            isMissing(error) ||
-            (error instanceof Error && "code" in error && error.code === "ELOOP")
-          )
-            return undefined;
-          throw error;
+      const rootFilesAllowed = rootFiles || declaredRoot;
+      const previousRootFiles = visited?.get(canonical);
+      if (
+        ancestors.has(canonical) ||
+        (scanning && previousRootFiles !== undefined && (previousRootFiles || !rootFilesAllowed))
+      )
+        return;
+      if (scanning) visited?.set(canonical, rootFilesAllowed);
+      ancestors.add(canonical);
+      try {
+        if (depth > LIMITS.preparationDepth)
+          throw new PreparationLimitError(
+            `Preparation depth exceeds ${LIMITS.preparationDepth}: ${directory}`,
+          );
+        let entries = directoryEntries.get(canonical);
+        if (!entries) {
+          await preparation.visitDirectory(directory, depth);
+          const collected: Dirent[] = [];
+          for await (const entry of preparation.directory(directory)) collected.push(entry);
+          collected.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+          entries = collected;
+          // Shared preparation limits bound this cache; aliases do not repeat filesystem scans.
+          directoryEntries.set(canonical, entries);
         }
-      };
-      const declared = entries.find((entry) => entry.name === "SKILL.md");
-      if (declared && (await kind(declared))?.isFile()) {
-        const path = join(directory, declared.name);
-        await load(path);
-        if (
-          source.patterns === undefined ||
-          source.patterns.some(
-            (pattern) =>
-              !/^[!+-]/.test(pattern) &&
-              sourcePatternMatches(relative(source.path, path).split(sep).join("/"), pattern, true),
+        const kind = async (entry: Dirent) => {
+          if (!entry.isSymbolicLink()) return entry;
+          try {
+            return await preparation.io(() => fs.stat(join(directory, entry.name)));
+          } catch (error) {
+            if (
+              isMissing(error) ||
+              (error instanceof Error && "code" in error && error.code === "ELOOP")
+            )
+              return undefined;
+            throw error;
+          }
+        };
+        const declared = entries.find((entry) => entry.name === "SKILL.md");
+        const hasSkill = declared !== undefined && (await kind(declared))?.isFile() === true;
+        if (hasSkill) {
+          const path = join(directory, "SKILL.md");
+          if (scanning || declares(path)) await load(path);
+        }
+        const scanChildren = scanning && !hasSkill;
+        if (source.patterns === undefined && !scanChildren) return;
+        for (const entry of entries) {
+          const path = join(directory, entry.name);
+          if (!scanChildren && !sourceDirectory(path, source.path, source.patterns)) continue;
+          const local = relative(source.path, path).split(sep).join("/");
+          const explicitlyReached = source.patterns?.some((pattern) => {
+            if (/^[!+-]/.test(pattern)) return false;
+            const target = pattern.replace(/^\.\//, "").replace(/\/$/, "");
+            const prefix = target.split(/[*?[{(]/, 1)[0]!;
+            return target === local || prefix.startsWith(`${local}/`);
+          });
+          if ((entry.name.startsWith(".") || entry.name === "node_modules") && !explicitlyReached)
+            continue;
+          const stat = await kind(entry);
+          if (stat?.isDirectory()) await walk(path, depth + 1, false, scanChildren);
+          else if (
+            stat?.isFile() &&
+            entry.name.endsWith(".md") &&
+            ((scanChildren && rootFilesAllowed) || declares(path))
           )
-        )
-          return;
-      }
-      if (source.patterns) {
-        const local = relative(source.path, directory).split(sep).join("/");
-        rootFiles = source.patterns.some(
-          (pattern) => !/^[!+-]/.test(pattern) && sourcePatternMatches(local, pattern),
-        );
-      }
-      for (const entry of entries) {
-        const local = relative(source.path, join(directory, entry.name)).split(sep).join("/");
-        const explicitlyReached = source.patterns?.some((pattern) => {
-          if (/^[!+-]/.test(pattern)) return false;
-          const target = pattern.replace(/^\.\//, "").replace(/\/$/, "");
-          const prefix = target.split(/[*?[{(]/, 1)[0]!;
-          return target === local || prefix.startsWith(`${local}/`);
-        });
-        if ((entry.name.startsWith(".") || entry.name === "node_modules") && !explicitlyReached)
-          continue;
-        const stat = await kind(entry);
-        if (stat?.isDirectory()) await walk(join(directory, entry.name), depth + 1, false);
-        else if (
-          stat?.isFile() &&
-          entry.name.endsWith(".md") &&
-          (rootFiles ||
-            (source.patterns !== undefined &&
-              source.patterns.some(
-                (pattern) =>
-                  !/^[!+-]/.test(pattern) &&
-                  sourcePatternMatches(
-                    relative(source.path, join(directory, entry.name)).split(sep).join("/"),
-                    pattern,
-                  ),
-              )))
-        )
-          await load(join(directory, entry.name));
+            await load(path);
+        }
+      } finally {
+        // A different declared path may reach this directory through an alias after this branch.
+        ancestors.delete(canonical);
       }
     };
 
     const canonical = await preparation.root(source.path);
     if (canonical === undefined) continue;
     const stat = await preparation.io(() => fs.stat(source.path));
-    if (stat.isDirectory()) await walk(source.path, 0, true);
+    if (stat.isDirectory()) await walk(source.path, 0, true, source.patterns === undefined);
     else if (stat.isFile() && source.path.endsWith(".md")) await load(source.path);
     else throw new Error(`Skill path is not a Markdown file or directory: ${source.path}`);
   }

@@ -8,5 +8,7 @@ coverage/
 .env.*
 !.env.example
 
+/packages/pi-project-instructions/dist/
+/packages/pi-subagents/.docs.internal/
 /packages/pi-subagents/ARCHITECTURE.md
 /packages/pi-subagents/CODEX_SUBAGENT_METHODS.md

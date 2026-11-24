@@ -6,6 +6,8 @@ import { test, type TestContext } from "node:test";
 import { setImmediate } from "node:timers/promises";
 import {
   createAssistantMessageEventStream,
+  getCurrentSystemMessage,
+  getSystemMessageText,
   type Api,
   type AssistantMessage,
   type Model,
@@ -40,6 +42,7 @@ async function fixture(
   stream?: ResearchHost["stream"],
   options: {
     maxModelTokens?: number;
+    retry?: ResearchHost["retry"];
     mutate?: () => string | void | Promise<string | void>;
   } = {},
 ) {
@@ -74,6 +77,7 @@ async function fixture(
   };
   let dispatched = false;
   const host: ResearchHost = {
+    retry: options.retry,
     cwd: root,
     workspace: inspectWorkspace(root),
     parentPrompt: "Do only the assigned research.",
@@ -1060,6 +1064,170 @@ test("cancellation preserves partial work through unknown-tool continuations wit
   await f.pool.drain();
 });
 
+for (const lateTool of [false, true]) {
+  test(`output cutoff preserves committed evidence without ${lateTool ? "admitting partial tool calls" : "replaying work"}`, async (t) => {
+    const receipt = "Committed receipt: payment-17";
+    const ledger: string[] = [];
+    let request = 0;
+    const tokens = [5, 7, 11];
+    const f = await fixture(
+      t,
+      (model, context) => {
+        const step = request++;
+        const stream = createAssistantMessageEventStream();
+        const evidence = context.messages.some(
+          (message) =>
+            message.role === "toolResult" &&
+            message.content.some((block) => block.type === "text" && block.text === receipt),
+        );
+        queueMicrotask(() => {
+          const message: AssistantMessage = {
+            role: "assistant",
+            api: model.api,
+            provider: model.provider,
+            model: model.id,
+            content:
+              step === 0
+                ? [{ type: "toolCall", id: "initial", name: "controlled_write", arguments: {} }]
+                : step === 1
+                  ? [
+                      { type: "text", text: lateTool ? receipt : "Incomplete review" },
+                      ...(lateTool
+                        ? [
+                            {
+                              type: "toolCall" as const,
+                              id: "partial",
+                              name: "controlled_write",
+                              arguments: {},
+                            },
+                          ]
+                        : []),
+                    ]
+                  : lateTool && step === 2
+                    ? [{ type: "toolCall", id: "replay", name: "controlled_write", arguments: {} }]
+                    : [{ type: "text", text: evidence ? receipt : "No retained evidence" }],
+            stopReason:
+              step === 0 || (lateTool && step === 2) ? "toolUse" : step === 1 ? "length" : "stop",
+            timestamp: Date.now(),
+            usage: {
+              input: 0,
+              output: tokens[step] ?? 0,
+              cacheRead: 0,
+              cacheWrite: 0,
+              totalTokens: tokens[step] ?? 0,
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+            },
+          };
+          stream.push({
+            type: "done",
+            reason: message.stopReason as "stop" | "length" | "toolUse",
+            message,
+          });
+          stream.end();
+        });
+        return stream;
+      },
+      {
+        mutate: () => {
+          ledger.push("payment-17");
+          return receipt;
+        },
+      },
+    );
+    t.after(() => f.pool.drain());
+    const result = await f.start().result;
+    assert.equal(result.text, receipt, "cutoff must hand back evidence of already committed work");
+    assert.deepEqual(
+      ledger,
+      ["payment-17"],
+      "neither partial tool calls nor handoff may repeat a payment",
+    );
+    assert.equal(
+      result.usage?.totalTokens,
+      tokens.reduce((total, value) => total + value, 0),
+      "original work and handoff usage must each be retained once",
+    );
+  });
+}
+
+test("provider failure cannot replay an effect or disclose optional diagnostic secrets", async (t) => {
+  const secret = "private-diagnostic-credential";
+  const responseId = "private-request-id";
+  const ledger: string[] = [];
+  let phase = 0;
+  const f = await fixture(
+    t,
+    (model, _context, options) => {
+      const first = phase++ === 0;
+      const stream = createAssistantMessageEventStream();
+      void (async () => {
+        if (!first)
+          await options?.onResponse?.({ status: 503, headers: { authorization: secret } }, model);
+        const message: AssistantMessage = {
+          role: "assistant",
+          api: model.api,
+          provider: model.provider,
+          model: model.id,
+          content: first
+            ? [{ type: "toolCall", id: "commit", name: "controlled_write", arguments: {} }]
+            : [],
+          stopReason: first ? "toolUse" : "error",
+          responseId: first ? undefined : responseId,
+          errorMessage: first ? undefined : "Provider unavailable",
+          diagnostics: first
+            ? undefined
+            : [
+                {
+                  type: "provider_error",
+                  timestamp: Date.now(),
+                  error: { message: secret, stack: secret, code: "ECONNRESET" },
+                  details: { body: secret, headers: { authorization: secret } },
+                },
+              ],
+          timestamp: Date.now(),
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+        };
+        if (first) stream.push({ type: "done", reason: "toolUse", message });
+        else stream.push({ type: "error", reason: "error", error: message });
+        stream.end();
+      })();
+      return stream;
+    },
+    {
+      mutate: () => {
+        ledger.push("committed");
+      },
+    },
+  );
+  t.after(() => f.pool.drain());
+  const run = f.start();
+  const result = await run.result;
+  assert.deepEqual(
+    ledger,
+    ["committed"],
+    "an upstream failure must never replay a committed operation",
+  );
+  assert.equal(
+    JSON.stringify(result).includes(secret),
+    false,
+    "optional provider metadata cannot disclose credentials",
+  );
+  assert.equal(
+    JSON.stringify(f.pool.inspect({ sessionId: "foreign", branch: new Set() }, run.runId)).includes(
+      responseId,
+    ),
+    false,
+    "another parent cannot read owned provider correlation data",
+  );
+});
+
 test("a token-limited final answer cannot complete the delegated task", async (t) => {
   const f = await fixture(t, (requested) => {
     const stream = createAssistantMessageEventStream();
@@ -1090,6 +1258,194 @@ test("a token-limited final answer cannot complete the delegated task", async (t
   assert.equal(result.outcome, "failed", "provider cutoff cannot establish task completion");
   await f.pool.drain();
 });
+
+function compactionHistory(cwd: string): SessionManager {
+  const history = SessionManager.inMemory(cwd);
+  history.appendMessage({
+    role: "user",
+    content: "Preserve the authorized payment receipt Cedar-17. " + "old evidence ".repeat(16000),
+    timestamp: Date.now(),
+  });
+  history.appendMessage({
+    role: "assistant",
+    api: "offline",
+    provider: "offline",
+    model: "child",
+    content: [{ type: "text", text: "Earlier assessment. ".repeat(5000) }],
+    stopReason: "stop",
+    timestamp: Date.now(),
+    usage: {
+      input: 89998,
+      output: 2,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 90000,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+  });
+  return history;
+}
+
+function compactionRequest(context: Parameters<ResearchHost["stream"]>[1]): boolean {
+  const system = getCurrentSystemMessage(context.messages);
+  return (
+    !!system &&
+    getSystemMessageText(system).startsWith("You are a context summarization assistant.")
+  );
+}
+
+test("compaction preserves payment evidence and work allowance through its final tool result", async (t) => {
+  let ingress: RunnerIngress;
+  let work = 0;
+  let reads = 0;
+  const invoice: number[] = [];
+  let retrySummary = true;
+  const receipt = "Authorized payment receipt Cedar-17";
+  const f = await fixture(
+    t,
+    (requested, context) => {
+      const compacting = compactionRequest(context);
+      const handoff = JSON.stringify(context.messages).includes("The delegated run has stopped");
+      const retained = JSON.stringify(context.messages).includes(receipt);
+      if (!compacting && !handoff) work++;
+      const effect = !compacting && !handoff && retained && work >= LIMITS.turns && reads < 2;
+      const transient = compacting && retrySummary;
+      if (compacting) retrySummary = false;
+      const stream = createAssistantMessageEventStream();
+      void (async () => {
+        if (!compacting && !handoff && retained && work < LIMITS.turns)
+          await ingress.steer("next-" + work, "Continue the authorized verification.");
+        invoice.push(compacting ? 7 : 3);
+        const message: AssistantMessage = {
+          role: "assistant",
+          api: requested.api,
+          provider: requested.provider,
+          model: requested.id,
+          content: effect
+            ? [{ type: "toolCall", id: "verify-" + work, name: "controlled_write", arguments: {} }]
+            : [{ type: "text", text: compacting ? receipt : "Verification finished." }],
+          stopReason: transient ? "error" : effect ? "toolUse" : "stop",
+          timestamp: Date.now(),
+          ...(transient ? { errorMessage: "503 temporarily unavailable" } : {}),
+          usage: {
+            input: effect && reads === 0 ? 89998 : 1,
+            output: 2,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: effect && reads === 0 ? 90000 : 3,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: compacting ? 7 : 3 },
+          },
+        };
+        if (transient) stream.push({ type: "error", reason: "error", error: message });
+        else stream.push({ type: "done", reason: effect ? "toolUse" : "stop", message });
+        stream.end();
+      })();
+      return stream;
+    },
+    {
+      retry: { enabled: true, maxRetries: 1, baseDelayMs: 1, maxAgentDelayMs: 1 },
+      mutate: async () => {
+        reads++;
+        if (reads === 2) await appendFile(join(f.cwd, "payments"), "Cedar-17 paid once\n");
+        return receipt + " supporting evidence ".repeat(5000);
+      },
+    },
+  );
+  t.after(() => f.pool.drain());
+  const history = compactionHistory(f.cwd);
+  const result = await f.start(undefined, {
+    history,
+    checkHistory() {},
+    delivery() {},
+    onReady(value) {
+      ingress = value;
+    },
+  }).result;
+  assert.equal(
+    await readFile(join(f.cwd, "payments"), "utf8").catch(() => ""),
+    "Cedar-17 paid once\n",
+    "compaction must preserve evidence and cannot consume the final authorized work turn or its tool-result continuation",
+  );
+  assert.equal(
+    result.usage?.cost.total,
+    invoice.reduce((sum, charge) => sum + charge, 0),
+    "all new provider charges, including compaction, must be accounted once without charging restored history",
+  );
+});
+
+for (const failure of ["error", "aborted", "cancel", "tokens"] as const)
+  test(
+    "compaction " + failure + " preserves incurred charges and prevents the payment",
+    async (t) => {
+      const abort = new AbortController();
+      let compacting = false;
+      const f = await fixture(
+        t,
+        (requested, context) => {
+          compacting = compactionRequest(context);
+          const stream = createAssistantMessageEventStream();
+          queueMicrotask(() => {
+            if (compacting && failure === "cancel") abort.abort();
+            const message: AssistantMessage = {
+              role: "assistant",
+              api: requested.api,
+              provider: requested.provider,
+              model: requested.id,
+              content: compacting
+                ? [{ type: "text", text: "Retained Cedar-17 evidence" }]
+                : [{ type: "toolCall", id: "pay", name: "controlled_write", arguments: {} }],
+              stopReason: compacting
+                ? failure === "error"
+                  ? "error"
+                  : failure === "cancel" || failure === "aborted"
+                    ? "aborted"
+                    : "stop"
+                : "toolUse",
+              ...(compacting && failure === "error" ? { errorMessage: "Invalid summary" } : {}),
+              timestamp: Date.now(),
+              usage: {
+                input: 3,
+                output: 2,
+                cacheRead: 0,
+                cacheWrite: 0,
+                totalTokens: 5,
+                cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 7 },
+              },
+            };
+            if (message.stopReason === "error" || message.stopReason === "aborted")
+              stream.push({ type: "error", reason: message.stopReason, error: message });
+            else stream.push({ type: "done", reason: compacting ? "stop" : "toolUse", message });
+            stream.end();
+          });
+          return stream;
+        },
+        {
+          maxModelTokens: failure === "tokens" ? 5 : undefined,
+          mutate: async () => {
+            await appendFile(join(f.cwd, "payments"), "forbidden payment\n");
+          },
+        },
+      );
+      t.after(() => f.pool.drain());
+      const history = compactionHistory(f.cwd);
+      const result = await f.start(abort.signal, {
+        history,
+        checkHistory() {},
+        delivery() {},
+        onReady() {},
+      }).result;
+      assert.equal(
+        await readFile(join(f.cwd, "payments"), "utf8").catch(() => ""),
+        "",
+        "failed, cancelled or token-exhausted compaction cannot authorize a later payment",
+      );
+      assert.equal(
+        result.usage?.cost.total,
+        7,
+        "failed or cancelled compaction still retains its incurred charge",
+      );
+    },
+  );
 
 test("binding failure disposes the acquired SDK session before releasing admission", async (t) => {
   const f = await fixture(t);

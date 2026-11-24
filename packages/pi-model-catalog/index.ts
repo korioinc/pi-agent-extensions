@@ -1,9 +1,11 @@
+import satisfies from "semver/functions/satisfies.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { envApiKeyAuth, type Provider } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import { builtinProviders, radiusProvider } from "@earendil-works/pi-ai/providers/all";
 import {
+  VERSION,
   buildSessionContext,
   getAgentDir,
   ModelRuntime,
@@ -22,6 +24,8 @@ import {
 import { registerModelPicker } from "./thinking.ts";
 
 export default async function modelCatalogExtension(pi: ExtensionAPI): Promise<void> {
+  if (!satisfies(VERSION, ">=1.6.0"))
+    throw new Error(`@korioinc/pi-model-catalog requires Pi >=1.6.0; found ${VERSION}.`);
   const modelsPath = join(getAgentDir(), "models.json");
   const cachePath = join(getAgentDir(), "models-cache.json");
   const offline = ["1", "true", "yes"].includes(process.env.PI_OFFLINE?.toLowerCase() ?? "");

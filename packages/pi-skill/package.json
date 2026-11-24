@@ -1,6 +1,6 @@
 {
   "name": "@korioinc/pi-skill",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Codex-style $skill-name invocation anywhere in a pi prompt",
   "keywords": [
     "codex",
@@ -30,9 +30,12 @@
     "check": "npm run typecheck && npm test",
     "prepack": "npm run check"
   },
+  "dependencies": {
+    "semver": "7.8.5"
+  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=1.4.0",
-    "@earendil-works/pi-tui": ">=1.4.0"
+    "@earendil-works/pi-coding-agent": ">=1.6.0",
+    "@earendil-works/pi-tui": ">=1.6.0"
   },
   "engines": {
     "node": ">=22.19.0"

@@ -10,7 +10,6 @@ import {
 } from "../runner-pool/index.ts";
 import { runResearch, type RunnerIngress } from "../runner/index.ts";
 import type { ResearchSource } from "../runtime/index.ts";
-import type { HandoffReference } from "../runtime/handoff.ts";
 import type { FollowupDelivery } from "../session/index.ts";
 import { LIMITS } from "../runtime/limits.ts";
 import { sameWorkspace, type WorkspaceIdentity } from "../workspace/identity.ts";
@@ -51,18 +50,24 @@ interface RecordOwner {
   };
   pending: Map<string, number>;
   stop?: (reason: string) => void;
+  /** Owned exclusively by the active foreground run; never overwritten by steering or messages. */
   input?: ParentAccess;
 }
 export type ParentSnapshot = Caller & {
   cwd: string;
+  rawCwd?: string;
   workspace: WorkspaceIdentity;
   anchor: string | null;
   trustedProject: boolean;
 };
 
+export type FastParentSnapshot = Omit<ParentSnapshot, "workspace">;
+
 export interface ParentAccess extends ResearchSource {
   /** Capture live authority without throwing; unavailable context/workspace returns undefined. */
   current(): ParentSnapshot | undefined;
+  /** Lightweight hot-path capture without synchronous filesystem syscalls; omits workspace stat. */
+  currentFast?(): FastParentSnapshot | undefined;
   fence(data: {
     agentId: string;
     runId: string;
@@ -72,15 +77,25 @@ export interface ParentAccess extends ResearchSource {
     nonce: string;
   }): string;
 }
-const idSchema = Type.String({
-  pattern: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+const idSchema = Type.String({ minLength: 1, maxLength: LIMITS.messageBytes });
+const requestSchema = Type.String({ minLength: 1, maxLength: LIMITS.messageBytes });
+export const agentIdSchema = Type.String({
+  ...idSchema,
+  description: "An existing agentId returned by subagent. Treated as an opaque string.",
 });
-const requestSchema = Type.String({ pattern: "^[A-Za-z0-9_-]{1,64}$" });
-export const followupParameters = Type.Object(
+const followupParameters = Type.Object(
   {
-    agentId: idSchema,
-    requestId: requestSchema,
-    message: Type.String({ minLength: 1, maxLength: LIMITS.taskBytes }),
+    agentId: agentIdSchema,
+    requestId: Type.String({
+      ...requestSchema,
+      description:
+        "Internal request identity supplied by the SDK tool call ID, preserved without modification.",
+    }),
+    message: Type.String({
+      minLength: 1,
+      maxLength: LIMITS.taskBytes,
+      description: "Continuation only: the next task for the existing agent.",
+    }),
   },
   { additionalProperties: false },
 );
@@ -107,12 +122,14 @@ const reject = (rejection: string) => ({
 class AgentAuthority {
   private readonly sessionId: string;
   private readonly workspace: WorkspaceIdentity;
+  private readonly rawCwd?: string;
   private readonly trustedProject: boolean;
   fence = "";
 
   constructor(caller: ParentSnapshot) {
     this.sessionId = caller.sessionId;
     this.workspace = caller.workspace;
+    this.rawCwd = caller.rawCwd;
     this.trustedProject = caller.trustedProject;
   }
 
@@ -121,6 +138,18 @@ class AgentAuthority {
       caller !== undefined &&
       caller.sessionId === this.sessionId &&
       sameWorkspace(caller.workspace, this.workspace) &&
+      caller.trustedProject === this.trustedProject &&
+      caller.branch.has(this.fence)
+    );
+  }
+
+  /** Fast hot-path check without workspace statting. Returns false if cwd changed or needs full check. */
+  allowsFast(caller: FastParentSnapshot | undefined): boolean {
+    return (
+      caller !== undefined &&
+      caller.sessionId === this.sessionId &&
+      (caller.cwd === this.workspace.root ||
+        (this.rawCwd !== undefined && caller.cwd === this.rawCwd)) &&
       caller.trustedProject === this.trustedProject &&
       caller.branch.has(this.fence)
     );
@@ -141,6 +170,18 @@ export class AgentRegistry {
   private check(record: RecordOwner): void {
     if (this.closing || !record.authority.allows(record.input?.current()))
       throw new Error("not_available");
+  }
+  private checkFast(record: RecordOwner): void {
+    if (this.closing) throw new Error("not_available");
+    const input = record.input;
+    if (!input) throw new Error("not_available");
+    if (!input.currentFast) {
+      this.check(record);
+      return;
+    }
+    const fast = input.currentFast();
+    if (!fast) throw new Error("not_available");
+    if (!record.authority.allowsFast(fast)) this.check(record);
   }
   private checkHistory(record: RecordOwner): void {
     if (record.historyError) throw new Error(record.historyError);
@@ -173,12 +214,20 @@ export class AgentRegistry {
       throw new Error(record.historyError, { cause: error });
     }
   }
-  private fence(record: RecordOwner, runId: string, kind: string, requestId?: string): string {
-    const input = record.input;
-    if (!input) throw new Error("not_available");
+  private fence(
+    record: RecordOwner,
+    input: ParentAccess,
+    runId: string,
+    kind: string,
+    requestId?: string,
+  ): string {
+    if (this.closing) throw new Error("not_available");
     const before = input.current();
     if (!before) throw new Error("not_available");
-    if (record.authority.fence) this.check(record);
+    if (record.authority.fence) {
+      if (!record.authority.allows(before)) throw new Error("not_available");
+      if (record.input) this.check(record);
+    }
     const revision = record.meta.revision + 1;
     const fence = input.fence({
       agentId: record.meta.agentId,
@@ -208,6 +257,8 @@ export class AgentRegistry {
     return {
       agentId,
       agent,
+      generation: this.pool.generation,
+      historyLifetime: "generation" as const,
       state,
       runId,
       outcome,
@@ -226,6 +277,8 @@ export class AgentRegistry {
         : reject("not_available");
     }
     return {
+      generation: this.pool.generation,
+      historyLifetime: "generation" as const,
       agents: [...this.agents.values()]
         .filter((record) => record.authority.allows(caller) && record.meta.state !== "closed")
         .map((record) => this.projection(record)),
@@ -233,7 +286,6 @@ export class AgentRegistry {
   }
   private reserve(
     record: RecordOwner,
-    input: ParentAccess,
     request?: Pick<Receipt, "requestId" | "digest">,
   ): () => void {
     let resolveDone!: () => void;
@@ -243,14 +295,10 @@ export class AgentRegistry {
         resolveDone = resolve;
       }),
     };
-    record.input = input;
     record.admission = admission;
     return () => {
       // Delivery can finish after another caller reserves the lane.
-      if (record.admission === admission) {
-        record.admission = undefined;
-        if (!record.stop) record.input = undefined;
-      }
+      if (record.admission === admission) record.admission = undefined;
       resolveDone();
     };
   }
@@ -258,11 +306,12 @@ export class AgentRegistry {
     input: ParentAccess,
     agent: string,
     task: string,
-    handoff?: HandoffReference,
     signal?: AbortSignal,
     progress?: (value: RunProgress & { agentId: string; state: State }) => void | Promise<void>,
+    onRevokedSettlement?: () => void,
   ) {
     if (this.closing) return reject("unavailable");
+    if (signal?.aborted) return reject("not_accepting");
     let record: RecordOwner;
     let release!: () => void;
     try {
@@ -274,7 +323,6 @@ export class AgentRegistry {
         LIMITS.retainedAgents
       )
         return reject("agent_capacity");
-      signal?.throwIfAborted();
       const agentId = randomUUID();
       record = {
         meta: {
@@ -289,33 +337,45 @@ export class AgentRegistry {
         pending: new Map(),
       };
       this.agents.set(agentId, record);
-      release = this.reserve(record, input);
+      release = this.reserve(record);
     } catch (error) {
       release?.();
       return reject(error instanceof Error ? error.message : "unavailable");
     }
-    return this.start(record, task, release, undefined, handoff, signal, progress);
+    return this.start(
+      record,
+      input,
+      task,
+      release,
+      undefined,
+      signal,
+      progress,
+      onRevokedSettlement,
+    );
   }
   private async start(
     record: RecordOwner,
+    foregroundInput: ParentAccess,
     task: string,
     release: () => void,
     requestId?: string,
-    handoff?: HandoffReference,
     signal?: AbortSignal,
     progress?: (value: RunProgress & { agentId: string; state: State }) => void | Promise<void>,
+    onRevokedSettlement?: () => void,
   ) {
+    let committed = false;
+    let ownsInput = false;
     try {
       const initial = record.meta.revision === 0;
       const previous = structuredClone(record.meta);
       const previousFence = record.authority.fence;
-      const foregroundInput = record.input;
-      const current = foregroundInput?.current();
-      if (!foregroundInput || !current) {
+      record.input = foregroundInput;
+      ownsInput = true;
+      const current = foregroundInput.current();
+      if (!current) {
         if (initial) this.agents.delete(record.meta.agentId);
         return reject("not_available");
       }
-      let committed = false;
       const submitted = this.pool.submit(
         { sessionId: current.sessionId, anchor: current.anchor },
         async (control) => {
@@ -327,20 +387,15 @@ export class AgentRegistry {
             record.historyError = "history_unusable";
             return { outcome: "failed", text: "", error: record.historyError };
           }
-          return this.invoke(
-            foregroundInput,
-            { task, agent: record.meta.agent, handoff },
-            control,
-            {
-              requestId,
-              history: record.history,
-              checkHistory: () => this.checkHistory(record),
-              onReady: (ingress) => {
-                record.ingress = ingress;
-              },
-              delivery: (id, state) => this.delivery(record, id, state),
+          return this.invoke(foregroundInput, { task, agent: record.meta.agent }, control, {
+            requestId,
+            history: record.history,
+            checkHistory: () => this.checkHistory(record),
+            onReady: (ingress) => {
+              record.ingress = ingress;
             },
-          );
+            delivery: (id, state) => this.delivery(record, id, state),
+          });
         },
         signal,
         (value) => {
@@ -356,11 +411,18 @@ export class AgentRegistry {
         {
           authorize: record.authority.allows.bind(record.authority),
           check: () => this.check(record),
+          checkFast: () => this.checkFast(record),
           commit: ({ runId, stop }) => {
             record.stop = stop;
             try {
               signal?.throwIfAborted();
-              const fence = this.fence(record, runId, initial ? "spawn" : "followup", requestId);
+              const fence = this.fence(
+                record,
+                foregroundInput,
+                runId,
+                initial ? "spawn" : "followup",
+                requestId,
+              );
               record.meta.runId = runId;
               record.meta.state = "active";
               if (requestId)
@@ -372,6 +434,7 @@ export class AgentRegistry {
                   state: "admitted",
                 });
               committed = true;
+              ownsInput = false;
               this.check(record);
             } catch (error) {
               if (!committed) {
@@ -382,7 +445,10 @@ export class AgentRegistry {
                 }
                 // Clear only this failed owner before another admission can reserve the lane.
                 record.stop = undefined;
-                record.input = undefined;
+                if (ownsInput) {
+                  record.input = undefined;
+                  ownsInput = false;
+                }
               }
               throw error;
             } finally {
@@ -404,18 +470,31 @@ export class AgentRegistry {
         return reject(error instanceof Error ? error.message : "unavailable");
       }
       // Unavailable authority denies disclosure without discarding safely settled usage.
-      if (!record.authority.allows(foregroundInput.current()))
+      if (!record.authority.allows(foregroundInput.current())) {
+        if (committed && result.phase === "terminal" && result.cleanup === "safe") {
+          try {
+            onRevokedSettlement?.();
+          } catch {
+            // Display failure cannot discard safely settled usage.
+          }
+        }
         return {
           ...reject("not_available"),
           usage: result.usage,
         };
+      }
       return {
         ...result,
+        historyLifetime: "generation" as const,
         agentId: record.meta.agentId,
         requestId,
         state: record.meta.state,
       };
     } finally {
+      if (ownsInput) {
+        record.input = undefined;
+        ownsInput = false;
+      }
       release();
     }
   }
@@ -471,9 +550,12 @@ export class AgentRegistry {
     value: unknown,
     signal?: AbortSignal,
     progress?: (value: RunProgress & { agentId: string; state: State }) => void | Promise<void>,
+    onRevokedSettlement?: () => void,
   ) {
     if (
       !Check(followupParameters, value) ||
+      !value.requestId.trim() ||
+      Buffer.byteLength(value.requestId) > LIMITS.messageBytes ||
       !value.message.trim() ||
       Buffer.byteLength(value.message) > LIMITS.taskBytes ||
       Buffer.from(value.message).toString("utf8") !== value.message
@@ -501,25 +583,28 @@ export class AgentRegistry {
       return receipt.digest === hash(value.message)
         ? {
             agentId: value.agentId,
+            generation: this.pool.generation,
+            historyLifetime: "generation" as const,
             ...this.projection(record).receipts.find((item) => item.requestId === value.requestId)!,
           }
         : reject("request_conflict");
     if (record.meta.state === "history_unusable") return reject("history_unusable");
     if (record.meta.receipts.length >= LIMITS.followupReceipts) return reject("request_capacity");
     if (signal?.aborted || record.meta.state === "blocked") return reject("not_accepting");
-    const release = this.reserve(record, input, {
+    const release = this.reserve(record, {
       requestId: value.requestId,
       digest: hash(value.message),
     });
     if (record.meta.state === "idle")
       return this.start(
         record,
+        input,
         value.message,
         release,
         value.requestId,
-        undefined,
         signal,
         progress,
+        onRevokedSettlement,
       );
     const ingress = record.ingress;
     try {
@@ -542,7 +627,9 @@ export class AgentRegistry {
       if (signal?.aborted || !ingress.accepting()) return reject("not_accepting");
       this.check(record);
       const runId = record.meta.runId!;
-      const fence = this.fence(record, runId, "followup", value.requestId);
+      const fence = this.fence(record, input, runId, "followup", value.requestId);
+      this.check(record);
+      if (!record.authority.allows(input.current())) return reject("not_available");
       record.meta.receipts.push({
         requestId: value.requestId,
         digest: hash(value.message),
@@ -551,13 +638,19 @@ export class AgentRegistry {
         state: "queued",
       });
       record.pending.set(value.requestId, bytes);
-      this.check(record);
       const delivery = ingress.steer(value.requestId, value.message);
       release();
       const state = await delivery;
       this.delivery(record, value.requestId, state);
       if (!record.authority.allows(input.current())) return reject("not_available");
-      return { agentId: value.agentId, requestId: value.requestId, runId, state };
+      return {
+        agentId: value.agentId,
+        requestId: value.requestId,
+        runId,
+        state,
+        generation: this.pool.generation,
+        historyLifetime: "generation" as const,
+      };
     } catch (error) {
       return reject(error instanceof Error ? error.message : "not_accepting");
     } finally {
@@ -572,17 +665,18 @@ export class AgentRegistry {
     const record = [...this.agents.values()].find((item) => item.meta.runId === runId);
     if (!record) return this.pool.sendMessage(caller, value, signal);
     if (!record.authority.allows(caller)) return reject("not_available");
-    if (record.admission) return reject("not_accepting");
-    const release = this.reserve(record, input);
+    let release: (() => void) | undefined;
     try {
       return this.pool.sendMessage(caller, value, signal, (messageId) => {
-        this.fence(record, record.meta.runId!, "supplemental", messageId);
+        if (record.admission) return false;
+        release = this.reserve(record);
+        this.fence(record, input, record.meta.runId!, "supplemental", messageId);
         this.check(record);
       });
     } catch {
       return reject("not_available");
     } finally {
-      release();
+      release?.();
     }
   }
   private remove(record: RecordOwner): void {

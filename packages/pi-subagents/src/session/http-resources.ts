@@ -1,19 +1,23 @@
+type ErrorMapper = (error: unknown, kind: "operation" | "cleanup" | "closed") => unknown;
+
 /** Own HTTP acquisitions and bodies without deciding the enclosing request or transport lifetime. */
 export class HttpResponseResources {
   private readonly acquiring = new Set<Promise<Response>>();
   private readonly readers = new Set<() => Promise<void>>();
   private readonly cleanupErrors: unknown[] = [];
-  private readonly mapError: (error: unknown) => unknown;
+  private readonly mapError: ErrorMapper;
+  private readonly onUnsafe: () => void;
   private closing?: Promise<void>;
 
-  constructor(mapError: (error: unknown) => unknown = (error) => error) {
+  constructor(mapError: ErrorMapper = (error) => error, onUnsafe: () => void = () => {}) {
     this.mapError = mapError;
+    this.onUnsafe = onUnsafe;
   }
 
   /** Wrap an acquired body before this operation settles, including a response arriving during close. */
   acquire(operation: () => Promise<Response>): Promise<Response> {
     const acquisition = Promise.resolve().then(() => {
-      if (this.closing) throw this.mapError(new Error("HTTP response owner is closed."));
+      if (this.closing) throw this.mapError(new Error("HTTP response owner is closed."), "closed");
       return operation();
     });
     this.acquiring.add(acquisition);
@@ -39,8 +43,9 @@ export class HttpResponseResources {
       try {
         reader.releaseLock();
       } catch (error) {
-        const failure = this.mapError(error);
+        const failure = this.mapError(error, "cleanup");
         this.cleanupErrors.push(failure);
+        this.onUnsafe();
         throw failure;
       } finally {
         released = true;
@@ -65,8 +70,9 @@ export class HttpResponseResources {
           )
             throw cancellation.reason;
         } catch (error) {
-          const failure = this.mapError(error);
+          const failure = this.mapError(error, "cleanup");
           this.cleanupErrors.push(failure);
+          this.onUnsafe();
           throw failure;
         } finally {
           release();
@@ -78,7 +84,7 @@ export class HttpResponseResources {
     const stop = () => {
       const cleanup = cancel();
       // Closing the owner must also settle a consumer's pending read without an extra abort step.
-      output.error(this.mapError(stopped()));
+      output.error(this.mapError(stopped(), "closed"));
       return cleanup;
     };
     const onAbort = () => {
@@ -109,9 +115,13 @@ export class HttpResponseResources {
           } catch (error) {
             try {
               await cancel();
-            } finally {
-              controller.error(this.mapError(error));
+            } catch (cleanupError) {
+              controller.error(this.mapError(cleanupError, "cleanup"));
+              return;
             }
+            controller.error(
+              this.mapError(error, signal.aborted || this.closing ? "closed" : "operation"),
+            );
           }
         },
         cancel,

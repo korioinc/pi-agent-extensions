@@ -62,7 +62,7 @@ export async function createResearchTools(
       typeof path !== "string" ||
       !path ||
       path.includes("\0") ||
-      path.split(sep).includes("..")
+      path.split(/[/\\]/).includes("..")
     ) {
       throw new Error("Provide a nonempty path without NUL or '..' components.");
     }

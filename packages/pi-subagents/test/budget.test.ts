@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
+import { appendFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createResearchTools, ToolCleanupError } from "../src/runtime/research-tools.ts";
@@ -7,11 +8,13 @@ import { test } from "node:test";
 import { Type } from "typebox";
 import { defineTool, type ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Budget } from "../src/runner/budget.ts";
-import { LIMITS } from "../src/runtime/limits.ts";
+import { LIMITS, DEFAULT_EXECUTION_LIMITS } from "../src/runtime/limits.ts";
 
-function controlledBudget(abort: AbortController): Budget {
+function controlledBudget(abort: AbortController, authorize: () => void = () => {}): Budget {
   const safeguard = new AbortController();
   return new Budget({
+    executionLimits: DEFAULT_EXECUTION_LIMITS,
+    remainingMs: () => DEFAULT_EXECUTION_LIMITS.invocationMs,
     signal: abort.signal,
     safeguardSignal: safeguard.signal,
     workSignal: abort.signal,
@@ -22,7 +25,10 @@ function controlledBudget(abort: AbortController): Budget {
     deadline: performance.now() + LIMITS.invocationMs,
     startupDeadline: performance.now() + LIMITS.startupMs,
     observation() {},
-    check: () => abort.signal.throwIfAborted(),
+    check: () => {
+      abort.signal.throwIfAborted();
+      authorize();
+    },
     stop: (reason) => abort.abort(reason),
     diagnostics() {},
     activity() {},
@@ -31,6 +37,192 @@ function controlledBudget(abort: AbortController): Budget {
     partial() {},
   });
 }
+
+test("cancelling a waiter preserves FIFO effects and releases its reservation", async (t) => {
+  const root = await fs.mkdtemp(join(tmpdir(), "pi-tool-batch-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = join(root, "effects.txt");
+  await fs.writeFile(file, "");
+  const abort = new AbortController();
+  const budget = controlledBudget(abort);
+  const gates = Array.from({ length: LIMITS.toolConcurrency }, () => {
+    let release!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { promise, release };
+  });
+  t.after(() => gates.forEach((gate) => gate.release()));
+  const [commit] = budget.tools([
+    defineTool({
+      name: "commit",
+      label: "Commit",
+      description: "Commit one admitted effect",
+      parameters: Type.Object({ record: Type.String() }),
+      async execute(_id, { record }, signal) {
+        if (record.startsWith("held-")) await gates[Number(record.slice(5))].promise;
+        signal?.throwIfAborted();
+        appendFileSync(file, `${record}\n`);
+        return { content: [], details: undefined };
+      },
+    }),
+  ]);
+  const call = (record: string, signal?: AbortSignal) =>
+    commit.execute(record, { record }, signal, undefined, {} as ExtensionToolContext);
+  const active = gates.map((_, i) => call(`held-${i}`));
+  const cancel = new AbortController();
+  const waiting = [call("forbidden", cancel.signal), call("first"), call("second")];
+  const results = Promise.allSettled([...active, ...waiting]);
+  cancel.abort();
+  gates[0].release();
+  await active[0];
+  await call("later");
+  gates.forEach((gate) => gate.release());
+  await results;
+  await budget.drain();
+  assert.deepEqual(
+    (await fs.readFile(file, "utf8"))
+      .trim()
+      .split("\n")
+      .filter((value) => !value.startsWith("held-")),
+    ["first", "second", "later"],
+    "a cancelled waiter must not commit or let a later writer overtake older work",
+  );
+});
+
+for (const stop of ["cancel", "revoke"] as const) {
+  test(`${stop} prevents queued effects without releasing uncooperative active work`, async (t) => {
+    const root = await fs.mkdtemp(join(tmpdir(), "pi-tool-wait-stop-"));
+    t.after(() => fs.rm(root, { recursive: true, force: true }));
+    const file = join(root, "effects.txt");
+    await fs.writeFile(file, "");
+    let permitted = true;
+    const abort = new AbortController();
+    const budget = controlledBudget(abort, () => {
+      if (!permitted) throw new Error("Authority revoked");
+    });
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    t.after(() => release());
+    const [commit] = budget.tools([
+      defineTool({
+        name: "commit",
+        label: "Commit",
+        description: "Commit an owned effect",
+        parameters: Type.Object({ record: Type.String() }),
+        async execute(_id, { record }) {
+          if (record === "forbidden") appendFileSync(file, "forbidden\n");
+          else {
+            await held;
+            appendFileSync(file, "owned-finished\n");
+          }
+          return { content: [], details: undefined };
+        },
+      }),
+    ]);
+    const active = Array.from({ length: LIMITS.toolConcurrency }, (_, i) =>
+      commit.execute(
+        String(i),
+        { record: "owned" },
+        undefined,
+        undefined,
+        {} as ExtensionToolContext,
+      ),
+    );
+    const queued = commit.execute(
+      "waiting",
+      { record: "forbidden" },
+      undefined,
+      undefined,
+      {} as ExtensionToolContext,
+    );
+    const all = Promise.allSettled([...active, queued]);
+    if (stop === "cancel") abort.abort();
+    else permitted = false;
+    const drained = budget.drain().then(() => appendFileSync(file, "ownership-released\n"));
+    await Promise.resolve();
+    assert.equal(
+      await fs.readFile(file, "utf8"),
+      "",
+      "owned work must finish before its barrier releases",
+    );
+    release();
+    await all;
+    await drained;
+    assert.equal(
+      await fs.readFile(file, "utf8"),
+      "owned-finished\n".repeat(LIMITS.toolConcurrency) + "ownership-released\n",
+      "queued work never acquires revoked authority, while existing effects finish before release",
+    );
+  });
+}
+
+test("queued cancellation returns unused effect allowance without admitting excess effects", async (t) => {
+  const root = await fs.mkdtemp(join(tmpdir(), "pi-tool-reservation-"));
+  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  const file = join(root, "effects.txt");
+  await fs.writeFile(file, "");
+  const budget = controlledBudget(new AbortController());
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  t.after(() => release());
+  const [commit] = budget.tools([
+    defineTool({
+      name: "commit",
+      label: "Commit",
+      description: "Commit an admitted record",
+      parameters: Type.Object({ record: Type.String() }),
+      async execute(_id, { record }, signal) {
+        await held;
+        signal?.throwIfAborted();
+        appendFileSync(file, `${record}\n`);
+        return { content: [], details: undefined };
+      },
+    }),
+  ]);
+  const cancel = new AbortController();
+  const records = Array.from({ length: LIMITS.toolCalls }, (_, i) => `owned-${i}`);
+  const work = records.map((record, i) =>
+    commit.execute(
+      record,
+      { record },
+      i === records.length - 1 ? cancel.signal : undefined,
+      undefined,
+      {} as ExtensionToolContext,
+    ),
+  );
+  const all = Promise.allSettled(work);
+  cancel.abort();
+  const replacement = commit.execute(
+    "replacement",
+    { record: "replacement" },
+    undefined,
+    undefined,
+    {} as ExtensionToolContext,
+  );
+  release();
+  await all;
+  await replacement;
+  await assert.rejects(
+    commit.execute(
+      "forbidden",
+      { record: "forbidden" },
+      undefined,
+      undefined,
+      {} as ExtensionToolContext,
+    ),
+  );
+  await budget.drain();
+  assert.deepEqual(
+    (await fs.readFile(file, "utf8")).trim().split("\n").sort(),
+    [...records.slice(0, -1), "replacement"].sort(),
+    "a cancelled reservation consumes no effect and cannot increase the invocation allowance",
+  );
+});
 
 for (const mode of [
   "direct",

@@ -9,7 +9,7 @@ Use $code-review and $simplify-codebase to improve the code.
 
 ## Installation
 
-Requires Pi 1.4.0 or later.
+Requires stable Pi 1.6.0 or later.
 
 After the first npm release, install the package with:
 

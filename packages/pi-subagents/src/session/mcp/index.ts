@@ -31,11 +31,18 @@ export class ChildMcp {
   private readonly servers: readonly McpServer[];
   private readonly signal: AbortSignal;
   private readonly checkStartup: () => void;
+  private readonly cleanupUnsafe: () => void;
 
-  constructor(servers: readonly McpServer[], signal: AbortSignal, checkStartup: () => void) {
+  constructor(
+    servers: readonly McpServer[],
+    signal: AbortSignal,
+    checkStartup: () => void,
+    cleanupUnsafe: () => void = () => {},
+  ) {
     this.servers = servers;
     this.signal = signal;
     this.checkStartup = checkStartup;
+    this.cleanupUnsafe = cleanupUnsafe;
     signal.addEventListener("abort", this.onAbort, { once: true });
   }
 
@@ -64,7 +71,7 @@ export class ChildMcp {
         if (!server) throw new Error("MCP server was not selected.");
         this.initialized.delete(server.name);
         this.listed.delete(server.name);
-        const transport = createMcpTransport(server, this.signal);
+        const transport = createMcpTransport(server, this.signal, this.cleanupUnsafe);
         this.transports.push(transport);
         const initializes = new Set<string | number>();
         const lists = new Set<string | number>();
@@ -173,15 +180,21 @@ export class ChildMcp {
   }
 
   private stopNative(): Promise<void> {
-    if (this.context && this.shutdown && !this.nativeClosing)
-      this.nativeClosing = Promise.resolve(
-        this.shutdown({ type: "session_shutdown", reason: "quit" }, this.context),
-      ).then(() => undefined);
+    const context = this.context;
+    const shutdown = this.shutdown;
+    if (context && shutdown && !this.nativeClosing)
+      this.nativeClosing = Promise.resolve()
+        .then(() => shutdown({ type: "session_shutdown", reason: "quit" }, context))
+        .then(() => undefined)
+        .catch((error) => {
+          this.cleanupUnsafe();
+          throw error;
+        });
     return this.nativeClosing ?? Promise.resolve();
   }
 
-  notify(): void {
-    this.startupError = true;
+  notify(type?: "info" | "warning" | "error"): void {
+    if (type === "error" || type === "warning") this.startupError = true;
   }
 
   ready(): void {
@@ -205,7 +218,14 @@ export class ChildMcp {
     const native = Promise.resolve().then(() => this.stopNative());
     this.closing = Promise.allSettled([
       native,
-      ...this.transports.map((transport) => transport.close()),
+      ...this.transports.map((transport) =>
+        Promise.resolve()
+          .then(() => transport.close())
+          .catch((error) => {
+            this.cleanupUnsafe();
+            throw error;
+          }),
+      ),
     ]).then((results) => {
       if (results.some((result) => result.status === "rejected"))
         throw new Error("Child MCP cleanup is unconfirmed.");

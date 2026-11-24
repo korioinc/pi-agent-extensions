@@ -108,7 +108,7 @@ function httpUrl(value: unknown, name: string): string {
   return url.href;
 }
 
-function parseServer(name: string, raw: unknown, cwd: string): McpServer {
+function parseServer(name: string, raw: unknown, cwd: string, maxToolMs: number): McpServer {
   if (!object(raw)) invalid(name, "configuration must be an object.");
   if ("auth" in raw || "oauth" in raw)
     invalid(name, "auth and oauth are unsupported; use explicit headers with ${NAME}.");
@@ -144,15 +144,15 @@ function parseServer(name: string, raw: unknown, cwd: string): McpServer {
       });
     }
   }
-  let timeoutMs = LIMITS.toolMs;
+  let timeoutMs = maxToolMs;
   if (raw.timeout !== undefined) {
     if (
       typeof raw.timeout !== "number" ||
       !Number.isFinite(raw.timeout) ||
       raw.timeout <= 0 ||
-      raw.timeout > LIMITS.toolMs / 1000
+      raw.timeout > maxToolMs / 1000
     )
-      invalid(name, `timeout must be positive seconds, at most ${LIMITS.toolMs / 1000}.`);
+      invalid(name, `timeout must be positive seconds, at most ${maxToolMs / 1000}.`);
     timeoutMs = raw.timeout * 1000;
   }
   const common = {
@@ -201,6 +201,7 @@ export async function loadMcpServers(
   names: readonly string[],
   cwd: string,
   preparation: Preparation,
+  maxToolMs: number = LIMITS.toolMs,
 ): Promise<McpServer[]> {
   if (names.length === 0) return [];
   preparation.check();
@@ -244,7 +245,9 @@ export async function loadMcpServers(
       invalid(selected, "configuration contains a conflicting normalized namespace.");
   }
   // Validate every selected entry before acquiring any selected environment values.
-  const servers = [...requested.values()].map((name) => parseServer(name, entries[name], cwd));
+  const servers = [...requested.values()].map((name) =>
+    parseServer(name, entries[name], cwd, maxToolMs),
+  );
   return servers.map((server) => {
     const transport = server.transport;
     return {

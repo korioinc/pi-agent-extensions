@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { setImmediate } from "node:timers/promises";
+import { inspect } from "node:util";
 import { McpClient, StreamableHttpTransport, type McpTransport } from "@earendil-works/pi-mcp";
 import { LIMITS } from "../src/runtime/limits.ts";
 import type { McpServer } from "../src/runtime/mcp.ts";
@@ -156,6 +157,32 @@ test("HTTP cannot forward configured authorization to another endpoint", async (
   await transport.close();
   assert.equal(unauthorizedWrites, 0, "cross-endpoint authorization must stop before dispatch");
 });
+
+for (const failure of ["fetch", "body", "http"] as const) {
+  test(`${failure} failures cannot disclose private transport diagnostics`, async (t) => {
+    const secret = "private-fixture-token";
+    t.mock.method(globalThis, "fetch", async () => {
+      const error = new TypeError(secret, { cause: new Error(secret) });
+      if (failure === "fetch") throw error;
+      if (failure === "http") return new Response(secret, { status: 503 });
+      return new Response(
+        new ReadableStream({
+          pull(controller) {
+            controller.error(error);
+          },
+        }),
+        { headers: { "content-type": "application/json" } },
+      );
+    });
+    const transport = createMcpTransport(httpServer, new AbortController().signal);
+    t.after(() => transport.close());
+    await transport.start();
+    await assert.rejects(transport.send(request), (error) => {
+      assert.ok(!inspect(error, { depth: null, customInspect: false }).includes(secret));
+      return true;
+    });
+  });
+}
 
 test("normal HTTP shutdown releases an open notification stream without poisoning cleanup", async (t) => {
   const received = gate();

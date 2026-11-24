@@ -108,3 +108,30 @@ test("MCP validation errors do not disclose configuration or resolved credential
     });
   }
 });
+
+test("MCP server timeout defaults and bounds follow generation executionLimits.toolMs", async (t) => {
+  const { root, config } = await fixture(t);
+  await fs.writeFile(
+    config,
+    JSON.stringify({
+      mcpServers: {
+        defaulted: { command: "unused-executable" },
+        extended: { command: "unused-executable", timeout: 240 },
+        short: { command: "unused-executable", timeout: 20 },
+      },
+    }),
+  );
+  const raised = await loadMcpServers(["defaulted", "extended"], root, preparation(), 300_000);
+  assert.equal(raised[0]!.timeoutMs, 300_000);
+  assert.equal(raised[1]!.timeoutMs, 240_000);
+
+  const lowered = await loadMcpServers(["defaulted", "short"], root, preparation(), 30_000);
+  assert.equal(lowered[0]!.timeoutMs, 30_000);
+  assert.equal(lowered[1]!.timeoutMs, 20_000);
+
+  await assert.rejects(
+    loadMcpServers(["extended"], root, preparation(), 30_000),
+    /at most 30\./,
+    "timeout above configured executionLimits.toolMs must be rejected",
+  );
+});

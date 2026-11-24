@@ -48,6 +48,9 @@ export async function resources(
                 (notice.remainingModelTokens === undefined
                   ? ""
                   : `${notice.remainingModelTokens} model-only tokens remain based on completed usage observations, not an invoice or tool budget. `) +
+                (notice.remainingMs === undefined
+                  ? ""
+                  : `Approximately ${Math.ceil(notice.remainingMs / 1000)} seconds remain in this invocation, including tool waiting. `) +
                 "Stop new exploration and finalize from the evidence already collected. " +
                 "State your findings, unfinished work and limitations. Hard limits and cancellation remain unchanged.",
             },
