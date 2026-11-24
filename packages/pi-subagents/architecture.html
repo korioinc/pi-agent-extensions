@@ -604,9 +604,9 @@
             selected-only <code>skillsOverride</code> inputs to the SDK resource loader. No custom
             composer or forced final prompt remains. The task is a separate initial user message
             inside <code>&lt;subagent_task&gt;</code>, with <code>&amp;&lt;&gt;</code> escaped as
-            XML text. Optional reference warning and <code>REFERENCE</code> JSON come before that
-            task block. Each spawn starts a new conversation without parent entries; follow-up
-            retains only that child’s native history.
+            XML text. The public <code>handoff</code> is one plain task string; nested reference
+            inputs are retired. Each spawn starts a new conversation without parent entries;
+            follow-up retains only that child’s native history.
           </p>
           <p class="note">
             <strong>One resource owner, one completion coordinator.</strong> Session implements SDK
@@ -628,12 +628,12 @@
           <div class="section-head">
             <h2 id="lifecycle">02 — Lifecycle &amp; completion</h2>
             <p>
-              <code>spawn_agent</code> creates a new <code>agentId</code> and first
-              <code>runId</code>. <code>followup_task({ agentId, requestId, message })</code> gives
-              an idle agent a fresh foreground runtime with current policy/tools and its native
-              conversation. A running agent instead receives steering and a receipt with no usage or
-              independent answer; the original run retains its remaining budget, deadline and
-              completion owner. Identical authorized retries return receipts without repeated
+              <code>subagent</code> creates a new <code>agentId</code> and first <code>runId</code>.
+              <code>followup_task({ agentId, handoff })</code> gives an idle agent a fresh
+              foreground runtime with current policy/tools and its native conversation. A running
+              agent instead receives steering and a receipt with no usage or independent answer; the
+              original run retains its remaining budget, deadline and completion owner. SDK call
+              identity stays internal; redelivery of the same call returns receipts without repeated
               effects or usage. <code>send_message</code> stays supplemental data, not a task or new
               turn.
             </p>
@@ -641,13 +641,16 @@
               <code>close_agent({ agentId })</code> idempotently closes idle or history-unusable
               agents and releases in-memory history and receipts. Active/blocked work must first be
               interrupted and safely settled. Spawn, follow-up and close are direct model-only
-              tools, denied to children. <code>subagent_inspect</code> accepts one of
+              tools, denied to children. <code>subagent_inspect</code> prefers one of
               <code>runId</code>, <code>agentId</code> or
               <code>scope: &quot;runs&quot; | &quot;agents&quot;</code>; no selector preserves run
-              inspection. Agent inspection returns metadata/receipts, never transcripts or
-              credentials. Controls, results, handoffs and activity require the same
-              parent/workspace and a branch containing the latest accepted input fence. Existing
-              activity presentation is unchanged.
+              inspection. Exact empty ID placeholders are ignored, and a scope matching one ID is
+              accepted. Raw non-string IDs, dual IDs and conflicting scopes are rejected; optional
+              null handling remains native to the SDK. Agent inspection returns metadata/receipts,
+              never transcripts or credentials. Controls, results, handoffs and activity require the
+              same parent/workspace and a branch containing the latest accepted input fence.
+              Existing activity rows show tool-slot waiting and structured failure guidance without
+              a new timer.
             </p>
             <p>
               AgentRegistry owns native <code>SessionManager.inMemory()</code> history until
@@ -655,6 +658,13 @@
               expiry. Reload, parent-session replacement and exit drain owned work, then discard
               history. A later generation cannot reopen the conversation. Terminal results and
               closed-agent tombstones retain their separate one-hour limits.
+            </p>
+            <p>
+              Logical results expose <code>generation</code> and
+              <code>historyLifetime: &quot;generation&quot;</code>. Unavailable controls provide
+              fixed current-agent inspection guidance without revealing the target. Check prior
+              effects before explicitly assigning fresh work. Repeated close remains successful only
+              for an authorized retained tombstone; it does not renew retention.
             </p>
             <p>
               Memory capacity failures mark history <code>history_unusable</code> and stop
@@ -1092,7 +1102,7 @@
             forced prompts fail. Neither mode inherits parent package/extension skill catalogs.
             Omitted or empty skill selection advertises none and performs no skill discovery.
             <code>@name task</code> requests parent-model delegation through
-            <code>spawn_agent({ agent, task })</code>; it does not guarantee execution. See
+            <code>subagent({ agent, handoff })</code>; it does not guarantee execution. See
             <a href="README.md">source coverage and migration</a>.
           </p>
         </section>
@@ -1153,8 +1163,8 @@
           </div>
           <p class="note">
             <strong>SDK adapter is in Session.</strong> Runner retains orchestration and budgets.
-            Stable SDK <code>&gt;=1.4.0 &lt;2.0.0</code> is supported. The development workspace
-            uses SDK 1.4.0.
+            Stable SDK <code>&gt;=1.6.0 &lt;2.0.0</code> is supported. The development workspace
+            uses SDK 1.6.0.
           </p>
         </section>
         <section aria-labelledby="bounds">
@@ -1166,15 +1176,22 @@
             <div>
               <dt>Execution</dt>
               <dd>
-                <strong>3 runs by default</strong> · startup <strong>60s</strong> · invocation
-                <strong>30m</strong> · stop grace <strong>5s</strong>. Full → <code>busy</code>;
-                draining → <code>unavailable</code>; degraded → remaining capacity usable. No queue.
-                Set <code>maxConcurrentRuns</code> from 1 through 32 in user
-                <code>sub-agents.json</code>; reload to apply. Each provider owner serializes its
-                requests through transport cleanup. Each run permits
+                <strong>5 runs by default</strong> · startup up to <strong>60s</strong> · default
+                invocation <strong>30m</strong> · stop grace <strong>5s</strong>. Full →
+                <code>busy</code>; draining → <code>unavailable</code>; degraded → remaining
+                capacity usable. No run queue. Set <code>maxConcurrentRuns</code> from 1 through 32
+                in user <code>sub-agents.json</code>; reload to apply. Optional
+                <code>executionLimits</code> configures invocation, tool and requested output limits
+                using one immutable generation snapshot. Tool timeout defaults to
+                <strong>180s</strong>; requested output defaults to <strong>8,192 tokens</strong>,
+                capped by the selected model and subject to adapter support. Each provider owner
+                serializes its requests through transport cleanup. Each run permits
                 <strong>256 actual tool starts</strong> and
                 <strong>4 concurrent leaf tools</strong>. Codemode itself is excluded; each nested
-                tool call consumes one start.
+                tool call consumes one start. Excess leaf calls reserve the remaining allowance and
+                wait FIFO inside the invocation. Waiting calls start no tool effect; active calls
+                retain their slots until actual settlement. Leaf timeouts start at grant, while
+                invocation and outer codemode deadlines include waiting.
               </dd>
             </div>
             <div>
@@ -1182,10 +1199,9 @@
               <dd>
                 Per file <strong>64 KiB</strong> · candidate reads <strong>8 MiB</strong> · roots
                 <strong>32</strong> · entries <strong>4096</strong> · depth <strong>16</strong> ·
-                prompt/configuration <strong>4 MiB</strong>. Preparation checks raw inputs;
-                preflight leaves <code>rendered_prompt</code> unchecked, along with
-                <code>skill_body_validation</code> when skills are selected. Startup checks the SDK
-                prompt, and each dispatch checks final system text plus effective tool declarations.
+                prompt/configuration <strong>4 MiB</strong>. Preparation checks raw inputs and
+                validates selected skill bodies before child startup. Startup checks the SDK prompt,
+                and each dispatch checks final system text plus effective tool declarations.
               </dd>
             </div>
             <div>
@@ -1203,11 +1219,20 @@
             </div>
           </dl>
           <p class="section-intro">
-            Turn, invocation, and tool deadlines enter <strong>safe guard</strong>: no new work, up
-            to <strong>30s</strong> to finish existing operations, then one no-tools handoff (up to
-            <strong>60s / 2,048 output tokens</strong>, within a <strong>90s</strong> window). The
-            result remains incomplete. Hard cancellation and token caps still win; unresolved
-            cleanup retains ownership and prevents summarization.
+            Counted turns, invocation/tool deadlines and model output length enter
+            <strong>safe guard</strong>: no new work, up to <strong>30s</strong> to finish existing
+            operations, then one no-tools handoff (up to <strong>60s / 2,048 output tokens</strong>,
+            within a <strong>90s</strong> window). The result remains incomplete. Hard cancellation
+            and token caps still win; unresolved cleanup retains ownership and prevents
+            summarization.
+          </p>
+          <p class="section-intro">
+            A bounded <code>failure</code> records the cause, stage and next action. Native HTTP and
+            model identifiers are included only when observed and allowlisted; raw headers, bodies
+            and diagnostic stacks are excluded. Cancellation and explicit limits take precedence
+            over secondary transport errors. Unknown causes remain unknown. Pending owned work may
+            settle; rejected or unsafe cleanup requires containment investigation. Neither failure
+            guidance nor a partial handoff authorizes automatic replay.
           </p>
           <p class="section-intro" style="font-size: 14px; margin-top: 16px">
             These bounds do not universally cap provider retries, billing, process memory, or

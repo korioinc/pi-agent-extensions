@@ -14,6 +14,7 @@ import { SessionManager, AgentSession } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { AgentRegistry, type ParentAccess } from "../src/agent-registry/index.ts";
 import { RunnerPool } from "../src/runner-pool/index.ts";
+import { SubagentDisplay } from "../src/controller/subagent-result.ts";
 import { runResearch, type RunnerIngress } from "../src/runner/index.ts";
 import type { ResearchHost } from "../src/runtime/index.ts";
 import { inspectWorkspace } from "../src/workspace/identity.ts";
@@ -213,21 +214,40 @@ for (const stop of ["cancel", "revoke"] as const)
     const f = await fixture(t);
     const ancestor = f.parent.getLeafId()!;
     let stopped = false;
-    await f.registry.spawn(
-      f.input,
-      "worker",
-      "Record a private finding",
-      undefined,
-      undefined,
-      (value) => {
-        if (stopped || value.phase !== "preparing") return;
-        stopped = true;
-        if (stop === "cancel") f.pool.cancel(f.input.current(), value.runId);
-        else f.parent.branch(ancestor);
-      },
-    );
+    await f.registry.spawn(f.input, "worker", "Record a private finding", undefined, (value) => {
+      if (stopped || value.phase !== "preparing") return;
+      stopped = true;
+      if (stop === "cancel") f.pool.cancel(f.input.current(), value.runId);
+      else f.parent.branch(ancestor);
+    });
     await assert.rejects(readFile(join(f.root, "effects")), { code: "ENOENT" });
   });
+
+test("revoked idle continuation closes only its published observation after settlement", async (t) => {
+  const f = await fixture(t);
+  const first = accepted(await f.registry.spawn(f.input, "worker", "Record a private finding"));
+  const ancestor = f.parent.getLeafId()!;
+  const evidence = await readFile(join(f.root, "effects"), "utf8");
+  const display = new SubagentDisplay();
+  const task = "Private continuation assignment";
+  const value = await f.registry.followup(
+    f.input,
+    { agentId: first.agentId, requestId: "revoke-continuation", message: task },
+    undefined,
+    (progress) => {
+      display.update({ details: {} }, task, progress, () => {});
+      f.parent.branch(ancestor);
+    },
+    display.revoke,
+  );
+  const final = display.finish({ details: value }, task);
+  assert.equal(await readFile(join(f.root, "effects"), "utf8"), evidence);
+  assert(!JSON.stringify(final).includes(task), "revoked task must not be republished");
+  assert(!JSON.stringify(final).includes("worker"), "revoked identity must not be republished");
+  assert.partialDeepStrictEqual(final, {
+    details: { results: [{ finished: true, stopReason: "error", step: 0 }] },
+  });
+});
 
 test("idle continuation retains real evidence, deduplicates concurrent retries and rejects sibling disclosure", async (t) => {
   const f = await fixture(t);
@@ -253,7 +273,7 @@ test("idle continuation retains real evidence, deduplicates concurrent retries a
   f.parent.branch(ancestor);
   f.parent.appendCustomEntry("sibling", {});
   assert(!JSON.stringify(f.registry.inspect(f.input, first.agentId)).includes("Private"));
-  assert("rejection" in f.pool.handoff(f.input.current(), accepted(second).runId));
+  assert("rejection" in f.pool.inspect(f.input.current(), accepted(second).runId));
   assert.equal(
     f.pool.inspectActivity(f.input.current()).length,
     0,
@@ -299,7 +319,7 @@ test("active steering returns before held work, stays in one run and supplementa
   let runId = "";
   let finished = false;
   const foreground = f.registry
-    .spawn(f.input, "worker", "Record a private finding", undefined, undefined, (value) => {
+    .spawn(f.input, "worker", "Record a private finding", undefined, (value) => {
       agentId = value.agentId;
       runId = value.runId;
     })
@@ -446,7 +466,6 @@ for (const stop of ["cancel", "shutdown"])
       "worker",
       "Record a private finding",
       undefined,
-      undefined,
       (value) => {
         agentId = value.agentId;
         runId = value.runId;
@@ -493,7 +512,6 @@ test("active configuration changes reject steering without changing the existing
     f.input,
     "worker",
     "Record a private finding",
-    undefined,
     undefined,
     (value) => {
       agentId = value.agentId;
@@ -584,7 +602,6 @@ test("settlement during asynchronous steering never starts a hidden turn", async
     "worker",
     "Record private finding",
     undefined,
-    undefined,
     (value) => {
       agentId = value.agentId;
     },
@@ -638,7 +655,7 @@ for (const ending of ["settlement", "cancellation"] as const) {
       let nativeHistory: SessionManager | undefined;
       let nativePrompt = "";
       const foreground = f.registry
-        .spawn(f.input, "worker", "Record private finding", undefined, undefined, (value) => {
+        .spawn(f.input, "worker", "Record private finding", undefined, (value) => {
           agentId = value.agentId;
           runId = value.runId;
         })
@@ -790,7 +807,6 @@ test("a completed steering delivery cannot release a newer admission", async (t)
     "worker",
     "Record private finding",
     undefined,
-    undefined,
     (value) => {
       agentId = value.agentId;
       runId = value.runId;
@@ -833,6 +849,98 @@ test("a completed steering delivery cannot release a newer admission", async (t)
   }
 });
 
+test("supplemental retries preserve accepted delivery during active follow-up validation", async (t) => {
+  const validating = deferred();
+  const resume = deferred();
+  const f = await fixture(
+    t,
+    withIngress((ingress) => ({
+      ...ingress,
+      validate: async () => {
+        validating.resolve();
+        await resume.promise;
+        return ingress.validate();
+      },
+    })),
+  );
+  f.hold();
+  let agentId = "";
+  let runId = "";
+  let observedMessages = "";
+  const stream = f.host.stream;
+  f.host.stream = (model, context, options) => {
+    observedMessages = JSON.stringify(context.messages);
+    return stream(model, context, options);
+  };
+  const foreground = f.registry.spawn(
+    f.input,
+    "worker",
+    "Record private finding",
+    undefined,
+    (value) => {
+      agentId = value.agentId;
+      runId = value.runId;
+    },
+  );
+  let followup: ReturnType<AgentRegistry["followup"]> | undefined;
+  try {
+    await f.entered.promise;
+    const message = { runId, messageId: "stable", message: "Accepted supplemental evidence" };
+    const first = f.registry.message(f.input, message);
+    assert.equal("state" in first ? first.state : undefined, "queued");
+    followup = f.registry.followup(f.input, {
+      agentId,
+      requestId: "active",
+      message: "Additional assigned task",
+    });
+    await validating.promise;
+    const entries = f.parent.getEntryCount();
+    assert.deepEqual(
+      f.registry.message(f.input, message),
+      first,
+      "an accepted retry must return its receipt without reserving the admission lane",
+    );
+    assert.deepEqual(
+      f.registry.message(f.input, { ...message, message: "Conflicting supplemental evidence" }),
+      { rejection: "message_conflict" },
+    );
+    const competing = { ...message, messageId: "new", message: "Unaccepted supplemental evidence" };
+    assert.deepEqual(f.registry.message(f.input, competing), { rejection: "not_accepting" });
+    assert.equal(f.parent.getEntryCount(), entries, "receipt lookups cannot append input fences");
+    const owner = f.input.current();
+    for (const foreign of [
+      { ...owner, sessionId: "foreign" },
+      { ...owner, branch: new Set<string>() },
+      { ...owner, workspace: { ...owner.workspace, key: "foreign" } },
+      { ...owner, trustedProject: !owner.trustedProject },
+    ]) {
+      assert.deepEqual(f.registry.message({ ...f.input, current: () => foreign }, message), {
+        rejection: "not_available",
+      });
+    }
+    resume.resolve();
+    await followup;
+    assert.deepEqual(f.registry.message(f.input, competing), {
+      runId,
+      messageId: competing.messageId,
+      state: "queued",
+    });
+    f.release.resolve();
+    await foreground;
+    assert.equal(
+      observedMessages.split(message.message).length - 1,
+      1,
+      "the accepted supplemental input must reach the child only once",
+    );
+    assert(!observedMessages.includes("Conflicting supplemental evidence"));
+    assert.equal(f.effects(), 1, "receipt retries cannot repeat the operation");
+  } finally {
+    resume.resolve();
+    f.release.resolve();
+    await Promise.allSettled([foreground, followup]);
+  }
+});
+
 test("intercepted active input cannot discard another queued task", async (t) => {
   const f = await fixture(t);
   f.hold();
@@ -841,7 +949,6 @@ test("intercepted active input cannot discard another queued task", async (t) =>
     f.input,
     "worker",
     "Record private finding",
-    undefined,
     undefined,
     (value) => {
       agentId = value.agentId;
@@ -878,7 +985,6 @@ test("supplemental input alone tightens every retained run fence", async (t) => 
     "worker",
     "Record private finding",
     undefined,
-    undefined,
     (value) => {
       agentId = value.agentId;
       runId = value.runId;
@@ -896,12 +1002,12 @@ test("supplemental input alone tightens every retained run fence", async (t) => 
   await foreground;
   f.parent.branch(ancestor);
   f.parent.appendCustomEntry("sibling", {});
-  assert("rejection" in f.pool.handoff(f.input.current(), runId));
+  assert("rejection" in f.pool.inspect(f.input.current(), runId));
   assert("rejection" in f.pool.cancel(f.input.current(), runId));
   assert.equal(f.pool.inspectActivity(f.input.current()).length, 0);
   assert("rejection" in f.registry.inspect(f.input, agentId));
   f.parent.branch(owner);
-  assert(!("rejection" in f.pool.handoff(f.input.current(), runId)));
+  assert(!("rejection" in f.pool.inspect(f.input.current(), runId)));
 });
 
 test("idle memory outlives run result retention while active ownership remains", async (t) => {
@@ -914,7 +1020,6 @@ test("idle memory outlives run result retention while active ownership remains",
     f.input,
     "worker",
     "Record active finding",
-    undefined,
     undefined,
     (value) => {
       activeId = value.agentId;
@@ -948,7 +1053,7 @@ test("a later task revokes earlier retained answers from the formerly authorized
     message: "Review earlier evidence",
   });
   const owner = f.parent.getLeafId()!;
-  const visible = () => JSON.stringify(f.pool.handoff(f.input.current(), first.runId));
+  const visible = () => JSON.stringify(f.pool.inspect(f.input.current(), first.runId));
   assert(visible().includes(first.text), "the current owner retains access to earlier evidence");
   f.parent.branch(previousOwner);
   f.parent.appendCustomEntry("sibling", {});
@@ -1095,4 +1200,99 @@ test("same-path directory replacement revokes retained workspace authority", asy
   assert.deepEqual(result, { rejection: "not_available" });
   assert.equal(f.requests(), requests);
   assert.deepEqual(f.registry.inspect(f.input, first.agentId), { rejection: "not_available" });
+});
+
+test("transient send_message and steering inputs do not overwrite the active foreground owner", async (t) => {
+  const f = await fixture(t);
+  f.hold();
+  let agentId = "";
+  let runId = "";
+  const foreground = f.registry.spawn(
+    f.input,
+    "worker",
+    "Record private finding",
+    undefined,
+    (value) => {
+      agentId = value.agentId;
+      runId = value.runId;
+    },
+  );
+  await f.entered.promise;
+
+  let messageAlive = true;
+  const messageInput: ParentAccess = {
+    ...f.input,
+    current: () => (messageAlive ? f.input.current() : undefined),
+  };
+  const msgResult = f.registry.message(messageInput, {
+    runId,
+    messageId: "transient-msg",
+    message: "Supplemental note",
+  });
+  assert.deepEqual(msgResult, { runId, messageId: "transient-msg", state: "queued" });
+  messageAlive = false;
+
+  let steerAlive = true;
+  const steerInput: ParentAccess = {
+    ...f.input,
+    current: () => (steerAlive ? f.input.current() : undefined),
+  };
+  const steerResult = await f.registry.followup(steerInput, {
+    agentId,
+    requestId: "transient-steer",
+    message: "Continue after note",
+  });
+  assert.equal("rejection" in steerResult, false);
+  steerAlive = false;
+
+  // Revoke check must still consult the live foreground owner, not the ended short-lived callers.
+  f.registry.revoke();
+  f.release.resolve();
+  const settled = accepted(await foreground);
+  assert.equal(settled.text, "Private finding recorded");
+});
+
+test("pre-aborted spawn rejects with not_accepting instead of unavailable", async (t) => {
+  const f = await fixture(t);
+  const controller = new AbortController();
+  controller.abort();
+  const result = await f.registry.spawn(f.input, "worker", "Do not start", controller.signal);
+  assert.deepEqual(result, { rejection: "not_accepting" });
+});
+
+test("failed uncommitted followup cannot clear a same-turn retry's active input when sharing ParentAccess", async (t) => {
+  const f = await fixture(t);
+  const first = accepted(await f.registry.spawn(f.input, "worker", "Record initial finding"));
+  let failOnce = true;
+  const origFence = f.input.fence;
+  const sharedInput: ParentAccess = {
+    ...f.input,
+    fence(data) {
+      if (failOnce) {
+        failOnce = false;
+        throw new Error("Transient fence failure");
+      }
+      return origFence(data);
+    },
+  };
+  f.hold();
+  const failed = f.registry.followup(sharedInput, {
+    agentId: first.agentId,
+    requestId: "failed-first",
+    message: "First attempt",
+  });
+  // Immediately start a same-turn retry reusing the exact same sharedInput reference
+  // before the uncommitted failed admission finishes settling its Pool result.
+  const retry = f.registry.followup(sharedInput, {
+    agentId: first.agentId,
+    requestId: "same-turn-retry",
+    message: "Review earlier evidence",
+  });
+  assert.deepEqual(await failed, { rejection: "unavailable" });
+  await f.entered.promise;
+  // Calling revoke() after failed's finally ran must still see retry's live sharedInput.
+  f.registry.revoke();
+  f.release.resolve();
+  const settled = accepted(await retry);
+  assert.equal(settled.text, "Prior finding verified");
 });

@@ -1,5 +1,7 @@
+import satisfies from "semver/functions/satisfies.js";
 import { join } from "node:path";
 import {
+  VERSION,
   getAgentDir,
   type ExtensionAPI,
   type ExtensionContext,
@@ -25,6 +27,8 @@ function statusText(settings: Settings, ctx: ExtensionContext): string | undefin
 }
 
 export default function serviceTierExtension(pi: ExtensionAPI): void {
+  if (!satisfies(VERSION, ">=1.6.0"))
+    throw new Error(`@korioinc/pi-service-tier requires Pi >=1.6.0; found ${VERSION}.`);
   const settingsPath = join(getAgentDir(), "extensions", "pi-service-tier.json");
   let startupModes: Set<Mode> | undefined;
 

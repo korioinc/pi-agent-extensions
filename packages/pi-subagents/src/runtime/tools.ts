@@ -1,5 +1,6 @@
 import type { ExtensionToolContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { AgentDefinition } from "./agents.ts";
+import { boundedText } from "./limits.ts";
 import { createResearchTools } from "./research-tools.ts";
 
 export type ToolHost = Pick<ExtensionToolContext, "cwd" | "executeTool" | "signal"> & {
@@ -17,7 +18,6 @@ export type ToolHost = Pick<ExtensionToolContext, "cwd" | "executeTool" | "signa
 };
 
 const PARENT_ORCHESTRATION_ROUTES = new Set([
-  "spawn_agent",
   "followup_task",
   "close_agent",
   "list_agents",
@@ -61,6 +61,14 @@ function blockedRoute(name: string, info: ToolMetadata | undefined): boolean {
   );
 }
 
+function toolPromptSnippet(description: string): string | undefined {
+  const line = description
+    .split(/\r\n|\r|\n/)
+    .map((part) => part.trim())
+    .find(Boolean);
+  return line ? boundedText(line, 240) : undefined;
+}
+
 function delegateTool(
   tool: HostTool,
   info: ToolMetadata | undefined,
@@ -72,7 +80,7 @@ function delegateTool(
     name,
     label: tool.label,
     description: tool.description,
-    promptSnippet: tool.description,
+    promptSnippet: toolPromptSnippet(tool.description),
     parameters: structuredClone(tool.parameters),
     executionMode: tool.executionMode,
     annotations: info?.annotations && structuredClone(info.annotations),

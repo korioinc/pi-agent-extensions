@@ -10,6 +10,8 @@ import {
   type Api,
 } from "@earendil-works/pi-ai";
 import { ChildSession } from "../src/session/index.ts";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_EXECUTION_LIMITS } from "../src/runtime/limits.ts";
 
 /** Real SDK/codemode path: server content stays in its authorized boundary. */
 test("native child discovery and calls cannot grant hidden or unselected effects", async (t) => {
@@ -53,6 +55,7 @@ else if(m.method==='tools/call'){if(m.params.name==='fail'){process.stdout.write
   };
   const pending: Promise<void>[] = [];
   let turn = 0;
+  let requestIndex = 0;
   let leaked = false;
   let exceptionLeaked = false;
   const scripts = [
@@ -65,6 +68,8 @@ else if(m.method==='tools/call'){if(m.params.name==='fail'){process.stdout.write
   ];
   const child = new ChildSession(
     {
+      retry: SettingsManager.inMemory().getRetrySettings(),
+      executionLimits: DEFAULT_EXECUTION_LIMITS,
       cwd: root,
       task: "Use selected tools",
       model,
@@ -131,10 +136,16 @@ else if(m.method==='tools/call'){if(m.params.name==='fail'){process.stdout.write
       signal: new AbortController().signal,
       safeguardSignal: new AbortController().signal,
       workSignal: new AbortController().signal,
+      safeguard() {},
       wrapTools: (t) => t,
       check() {},
       checkStartup() {},
-      request() {},
+      cleanupUnsafe() {},
+      request: () => ({
+        requestIndex: ++requestIndex,
+        remainingMs: DEFAULT_EXECUTION_LIMITS.invocationMs,
+      }),
+      modelFailure() {},
       takeWrapUpNotice: () => undefined,
       takeMessages: () => [],
       exceeded(limit) {

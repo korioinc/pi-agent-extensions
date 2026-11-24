@@ -5,7 +5,7 @@ When both modes are enabled, each request uses Ultrafast if the model supports i
 
 ## Installation
 
-Requires Pi 1.4.0 or later.
+Requires stable Pi 1.6.0 or later.
 
 After the first npm release:
 

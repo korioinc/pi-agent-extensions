@@ -32,8 +32,11 @@
     "check": "npm run typecheck && npm test",
     "prepack": "npm run check"
   },
+  "dependencies": {
+    "semver": "7.8.5"
+  },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=1.4.0"
+    "@earendil-works/pi-coding-agent": ">=1.6.0"
   },
   "engines": {
     "node": ">=22.19.0"

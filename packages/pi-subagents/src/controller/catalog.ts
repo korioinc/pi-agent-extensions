@@ -7,37 +7,17 @@ import {
 } from "../runtime/discovery.ts";
 import { boundedText, LIMITS } from "../runtime/limits.ts";
 import { safeErrorText } from "../runtime/errors.ts";
-import {
-  prepareResearch,
-  type PreparationStage,
-  type ResearchConfig,
-  type ResearchSource,
-  type ResolvedSelection,
-} from "../runtime/index.ts";
-
-type PreflightStage = PreparationStage | "input" | "report";
-type PreflightCode =
-  | "invalid_input"
-  | "preparation_failed"
-  | "host_unavailable"
-  | "limit_exceeded"
-  | "cancelled"
-  | "report_unavailable";
-
-export function preflightFailure(code: PreflightCode, stage: PreflightStage) {
-  return { status: "invalid_configuration" as const, code, stage };
-}
 
 type Catalog = Awaited<ReturnType<typeof discoverAgents>>;
 type Entry = Omit<AgentDefinition, "systemPrompt">;
 
-/** One bounded list/check owns its lifetime without an execution slot or child effects. */
+/** One bounded catalog listing owns its lifetime without an execution slot or child effects. */
 export class AgentCatalog {
   private active?: {
     abort: AbortController;
     done: Promise<unknown>;
     origin: Origin;
-    kind: "list" | "preflight";
+    kind: "list";
     startedAt: number;
     started: number;
     stage: "discovering" | "cancelling" | "unsafe";
@@ -77,80 +57,7 @@ export class AgentCatalog {
     active.stageStarted = performance.now();
   }
 
-  list(origin: Origin, signal?: AbortSignal) {
-    return this.perform(
-      origin,
-      "list",
-      signal,
-      async (preparation) => boundedCatalog(await discoverAgents(preparation)),
-      (error) => ({
-        rejection: "denied" as const,
-        error: boundedText(safeErrorText(error, "Catalog operation failed."), 4096),
-      }),
-    );
-  }
-
-  preflight(origin: Origin, agent: string, source: ResearchSource, signal?: AbortSignal) {
-    let stage: PreflightStage = "host";
-    return this.perform(
-      origin,
-      "preflight",
-      signal,
-      async (preparation, combined) => {
-        const captureBound = (includeParentPrompt: boolean) => {
-          preparation.check();
-          const host = source.capture(includeParentPrompt);
-          preparation.check();
-          return Object.freeze({
-            ...host,
-            signal: AbortSignal.any([combined, ...(host.signal ? [host.signal] : [])]),
-          });
-        };
-        preparation.check();
-        const host = source.scope();
-        preparation.check();
-        const config = await prepareResearch(
-          host,
-          "",
-          agent,
-          preparation,
-          captureBound,
-          (value) => {
-            stage = value;
-          },
-        );
-        preparation.check();
-        stage = "report";
-        const report = preflightReport(config);
-        preparation.check();
-        return report;
-      },
-      (error, combined) =>
-        preflightFailure(
-          signal?.aborted
-            ? "cancelled"
-            : error instanceof PreparationLimitError ||
-                (combined.aborted && combined.reason instanceof PreparationLimitError)
-              ? "limit_exceeded"
-              : combined.aborted
-                ? "cancelled"
-                : stage === "host"
-                  ? "host_unavailable"
-                  : stage === "report"
-                    ? "report_unavailable"
-                    : "preparation_failed",
-          stage,
-        ),
-    );
-  }
-
-  private async perform<T, F>(
-    origin: Origin,
-    kind: "list" | "preflight",
-    signal: AbortSignal | undefined,
-    operation: (preparation: Preparation, signal: AbortSignal) => Promise<T>,
-    failure: (error: unknown, signal: AbortSignal) => F,
-  ) {
+  async list(origin: Origin, signal?: AbortSignal) {
     if (this.draining) return { rejection: "unavailable" as const };
     if (this.active) return { rejection: "busy" as const };
     const abort = new AbortController();
@@ -164,7 +71,7 @@ export class AgentCatalog {
     const done = Promise.resolve()
       .then(async () => {
         const preparation = new Preparation(combined, deadline);
-        return operation(preparation, combined);
+        return boundedCatalog(await discoverAgents(preparation));
       })
       .catch((error: unknown) => {
         if (error instanceof PreparationSafetyError) {
@@ -175,7 +82,10 @@ export class AgentCatalog {
           // As with an unsafe invocation, no timeout can prove the handle is closed.
           return new Promise<never>(() => {});
         }
-        return failure(error, combined);
+        return {
+          rejection: "denied" as const,
+          error: boundedText(safeErrorText(error, "Catalog operation failed."), 4096),
+        };
       });
     const started = performance.now();
     const startedAt = Date.now();
@@ -183,7 +93,7 @@ export class AgentCatalog {
       abort,
       done,
       origin: { ...origin },
-      kind,
+      kind: "list",
       started,
       startedAt,
       stage: "discovering",
@@ -209,60 +119,6 @@ export class AgentCatalog {
     active.abort.abort("shutdown");
     await Promise.allSettled([active.done]);
   }
-}
-
-function preflightReport(config: ResearchConfig) {
-  const { model, modelSource, thinkingLevel, thinkingSource } = config.selection;
-  const selection = { model, modelSource, thinkingLevel, thinkingSource };
-  const report: {
-    status: "configuration_valid";
-    checkedAt: number;
-    selection?: ResolvedSelection;
-    maxModelTokens?: number;
-    promptMode: ResearchConfig["promptMode"];
-    skillCount: number;
-    ordinaryToolCount: number;
-    mcpServerCount: number;
-    mcp: {
-      name: string;
-      transport: "stdio" | "http";
-      exposure: ResearchConfig["mcp"][number]["exposure"];
-    }[];
-    omittedMcpServers: number;
-    unchecked: string[];
-  } = {
-    status: "configuration_valid",
-    checkedAt: Date.now(),
-    ...(Buffer.byteLength(JSON.stringify(selection)) <= LIMITS.selectionBytes ? { selection } : {}),
-    ...(config.maxModelTokens === undefined ? {} : { maxModelTokens: config.maxModelTokens }),
-    promptMode: config.promptMode,
-    skillCount: config.skills.length,
-    ordinaryToolCount: config.tools.length,
-    mcpServerCount: config.mcp.length,
-    mcp: [],
-    omittedMcpServers: config.mcp.length,
-    unchecked: [
-      "model_authentication",
-      "mcp_connectivity",
-      "mcp_catalog",
-      "rendered_prompt",
-      ...(config.skills.length ? ["skill_body_validation"] : []),
-      "task",
-      "tool_permissions_at_call",
-    ],
-  };
-  for (const server of config.mcp) {
-    report.mcp.push({
-      name: server.name,
-      transport: server.transport.type,
-      exposure: server.exposure,
-    });
-    if (Buffer.byteLength(JSON.stringify(report)) > LIMITS.catalogBytes) report.mcp.pop();
-    else report.omittedMcpServers--;
-  }
-  if (Buffer.byteLength(JSON.stringify(report)) > LIMITS.catalogBytes)
-    throw new Error("Preflight report exceeds its output budget.");
-  return report;
 }
 
 function boundedCatalog(catalog: Catalog) {

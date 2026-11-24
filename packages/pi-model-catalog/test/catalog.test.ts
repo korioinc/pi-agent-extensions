@@ -4,7 +4,7 @@ import { createServer, type RequestListener } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
@@ -14,6 +14,17 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import extension from "../index.ts";
 import { fetchCatalog, parseCatalog } from "../catalog.ts";
+
+// Pi refreshes its own model store in the background after provider registration.
+// These tests exercise the extension's on-disk models-cache.json, not the host store.
+function catalogRuntime(modelsPath: string) {
+  return ModelRuntime.create({
+    modelsPath,
+    credentials: new InMemoryCredentialStore(),
+    modelsStore: new InMemoryModelsStore(),
+    refreshOnCreate: false,
+  });
+}
 
 async function serve(t: TestContext, handler: RequestListener): Promise<string> {
   const server = createServer(handler);
@@ -64,11 +75,7 @@ test("catalog loading leaves the user's models.json byte-for-byte intact on succ
     },
   })},\n}\n`;
   await writeFile(path, original);
-  const runtime = await ModelRuntime.create({
-    credentials: new InMemoryCredentialStore(),
-    modelsPath: path,
-    refreshOnCreate: false,
-  });
+  const runtime = await catalogRuntime(path);
   const pi = {
     registerProvider: runtime.registerNativeProvider.bind(runtime),
     on() {},
@@ -117,11 +124,7 @@ test("remote metadata cannot redirect model credentials or install request heade
       },
     }),
   );
-  const runtime = await ModelRuntime.create({
-    credentials: new InMemoryCredentialStore(),
-    modelsPath: path,
-    refreshOnCreate: false,
-  });
+  const runtime = await catalogRuntime(path);
   await extension({
     registerProvider: runtime.registerNativeProvider.bind(runtime),
     on() {},
@@ -169,11 +172,7 @@ test("a cached model remains usable when the catalog endpoint becomes unavailabl
     }),
   );
   async function load() {
-    const runtime = await ModelRuntime.create({
-      credentials: new InMemoryCredentialStore(),
-      modelsPath: path,
-      refreshOnCreate: false,
-    });
+    const runtime = await catalogRuntime(path);
     await extension({
       registerProvider: runtime.registerNativeProvider.bind(runtime),
       on() {},
@@ -295,6 +294,7 @@ test("a short default model selects its catalog model without rewriting settings
   const services = await createAgentSessionServices({
     cwd: directory,
     agentDir: directory,
+    modelRuntime: await catalogRuntime(join(directory, "models.json")),
     resourceLoaderOptions: {
       additionalExtensionPaths: [join(import.meta.dirname, "../index.ts")],
       noExtensions: true,

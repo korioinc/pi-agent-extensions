@@ -4,7 +4,7 @@ import {
   type ExtensionToolContext,
   type NormalizedBuildSystemPromptOptions,
 } from "@earendil-works/pi-coding-agent";
-import { SPAWN_GUIDELINES } from "../instructions/parent.ts";
+import { SUBAGENT_GUIDELINES } from "../instructions/parent.ts";
 
 /** Keep provenance, not a second copy of the parent's rendered resource catalogs. */
 export function registerParentPrompt(pi: ExtensionAPI) {
@@ -46,13 +46,13 @@ export function registerParentPrompt(pi: ExtensionAPI) {
     if (options.sections.cwd === undefined) delete sections.cwd;
     // SDK 1.3 exposes rendered sections, but not its prompt builder as a public API.
     // Remove only our exact native rule entries; never rebuild or discard user rules.
-    const ownedRules = new Set(SPAWN_GUIDELINES.map((rule) => `- ${rule}`));
+    const ownedRules = new Set(SUBAGENT_GUIDELINES.map((rule) => `- ${rule}`));
     if (sections.rules) {
       if (
         options.sections.rules !== undefined &&
         !options.customPrompt &&
-        options.selectedTools.includes("spawn_agent") &&
-        !options.hiddenTools.includes("spawn_agent")
+        options.selectedTools.includes("subagent") &&
+        !options.hiddenTools.includes("subagent")
       )
         throw new Error(
           "Cannot isolate subagent delegation guidance in overridden rules. Preserve native tool guidelines or use an explicit replace agent.",
@@ -64,7 +64,8 @@ export function registerParentPrompt(pi: ExtensionAPI) {
     }
     if (
       Object.values(sections).some(
-        (text) => typeof text === "string" && SPAWN_GUIDELINES.some((rule) => text.includes(rule)),
+        (text) =>
+          typeof text === "string" && SUBAGENT_GUIDELINES.some((rule) => text.includes(rule)),
       )
     )
       throw new Error(

@@ -188,6 +188,67 @@ test("manifest overrides cannot introduce undeclared instruction sources", async
   await assert.rejects(resolveSkills(definition(root), root, false, preparation()));
 });
 
+test("independent package declarations can select a skill beneath another skill", async (t) => {
+  const root = await fixture(t);
+  const packageRoot = join(root, "package");
+  await skill(packageRoot, "root", "---\nname: outer\ndescription: Outer\n---\nOUTER");
+  await skill(packageRoot, "root/nested", "---\nname: selected\ndescription: Nested\n---\nNESTED");
+  await skill(
+    packageRoot,
+    "root/private",
+    "---\nname: private\ndescription: Undeclared\n---\nPRIVATE",
+  );
+  await fs.symlink(join(packageRoot, "skills", "root"), join(packageRoot, "alias"), "dir");
+  await fs.symlink(
+    join(packageRoot, "skills", "root", "nested"),
+    join(packageRoot, "nested-alias"),
+    "dir",
+  );
+  await fs.symlink(packageRoot, join(packageRoot, "skills", "root", "cycle"), "dir");
+  await fs.mkdir(join(packageRoot, "skills", "a"));
+  await fs.mkdir(join(packageRoot, "skills", "z"));
+  await fs.writeFile(
+    join(packageRoot, "skills", "z", "loose.md"),
+    "---\nname: loose\ndescription: Root Markdown\n---\nROOT INSTRUCTIONS",
+  );
+  await fs.symlink(
+    join(packageRoot, "skills", "z"),
+    join(packageRoot, "skills", "a", "alias"),
+    "dir",
+  );
+  await fs.writeFile(
+    join(root, "user", "settings.json"),
+    JSON.stringify({ packages: [packageRoot] }),
+  );
+  const select = async (patterns: string[], name = "selected") => {
+    await fs.writeFile(
+      join(packageRoot, "package.json"),
+      JSON.stringify({ pi: { skills: patterns } }),
+    );
+    return resolveSkills({ ...definition(root), skills: [name] }, root, false, preparation());
+  };
+
+  await assert.rejects(select(["skills/root"]));
+  await assert.rejects(select(["skills/*"]));
+  for (const nested of [
+    "skills/root/nested",
+    "skills/root/nested/SKILL.md",
+    "skills/*/nested",
+    "skills/*/*",
+    "skills/**/SKILL.md",
+    "skills/**",
+    "skills/{root,root/nested}",
+  ])
+    await select(["skills/root", nested]);
+  await select(["alias", "skills/root/nested"]);
+  await assert.rejects(select(["skills/root", "skills/root/nested"], "private"));
+  await assert.rejects(select(["skills/root", "skills/root/nested", "!skills/root/nested"]));
+  await assert.rejects(select(["nested-alias", "!nested-alias"]));
+  await select(["nested-alias", "skills/root/nested", "!nested-alias"]);
+  await assert.rejects(select(["skills/a"], "loose"));
+  await select(["skills/*"], "loose");
+});
+
 test("an expired deadline prevents instruction acquisition", async (t) => {
   const root = await fixture(t);
   const path = join(root, "instructions.md");
@@ -224,16 +285,30 @@ test("skipped entries still consume the shared discovery budget", async (t) => {
   }, PreparationLimitError);
 });
 
-test("symlink cycles do not exhaust traversal", async (t) => {
+test("symlink cycles and aliases do not exhaust traversal of one bounded skill tree", async (t) => {
   const root = await fixture(t);
   await skill(
     root,
-    "selected",
+    "shared/selected",
     "---\nname: selected\ndescription: Selected instructions\n---\nCYCLE-SAFE-INSTRUCTION",
   );
-  await fs.symlink(join(root, "skills"), join(root, "skills", "loop"), "dir");
-  await fs.symlink(join(root, "skills", "selected"), join(root, "skills", "alias"), "dir");
+  const shared = join(root, "skills", "shared");
+  const aliases = 3;
+  await Promise.all(
+    Array.from({ length: Math.floor(LIMITS.preparationEntries / (aliases + 1)) }, (_, index) =>
+      fs.writeFile(join(shared, `${index}.txt`), ""),
+    ),
+  );
   await resolveSkills(definition(root), root, false, preparation());
+  await fs.symlink(join(root, "skills"), join(root, "skills", "loop"), "dir");
+  for (let index = 0; index < aliases; index++)
+    await fs.symlink(shared, join(root, "skills", `alias-${index}`), "dir");
+  await resolveSkills(definition(root), root, false, preparation());
+  await fs.writeFile(join(root, "user", "settings.json"), JSON.stringify({ packages: [root] }));
+  for (const pattern of ["skills", "skills/*", "skills/**", "skills/{alias-*,shared}"]) {
+    await fs.writeFile(join(root, "package.json"), JSON.stringify({ pi: { skills: [pattern] } }));
+    await resolveSkills(definition(root), root, false, preparation());
+  }
 });
 
 test("cancelled reads stay owned until their pending read and close both finish", async (t) => {

@@ -4,6 +4,7 @@ import {
   type AgentSession,
   type CreateAgentSessionOptions,
   type ExtensionFactory,
+  type ExtensionUIContext,
   type ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { ResearchConfig } from "../runtime/index.ts";
@@ -12,7 +13,10 @@ import type { SessionHooks } from "./index.ts";
 import { ChildMcp } from "./mcp/index.ts";
 
 type ToolConfig = Pick<ResearchConfig, "tools" | "mcp">;
-type ToolHooks = Pick<SessionHooks, "signal" | "checkStartup" | "wrapTools" | "exceeded">;
+type ToolHooks = Pick<
+  SessionHooks,
+  "signal" | "checkStartup" | "wrapTools" | "exceeded" | "cleanupUnsafe"
+>;
 
 /** Canonical metadata order, independent of MCP connection timing and tools/list order. */
 function orderedTools<T extends { name: string }>(tools: readonly T[]): T[] {
@@ -31,7 +35,7 @@ export class ChildTools {
     this.config = config;
     this.hooks = hooks;
     // Defer factories and tool wrapping until ChildSession has stored this owner.
-    this.mcp = new ChildMcp(config.mcp, hooks.signal, hooks.checkStartup);
+    this.mcp = new ChildMcp(config.mcp, hooks.signal, hooks.checkStartup, hooks.cleanupUnsafe);
   }
 
   sessionOptions(): Pick<CreateAgentSessionOptions, "noTools" | "tools" | "customTools"> {
@@ -72,12 +76,17 @@ export class ChildTools {
     return extensions;
   }
 
+  /** Passed to bindExtensions so startup warnings/errors during session_start are observed. */
+  uiContext(session: AgentSession): ExtensionUIContext | undefined {
+    if (!this.config.mcp.length) return undefined;
+    const ui = session.extensionRunner.getUIContext();
+    return { ...ui, notify: (_message, type) => this.mcp.notify(type) };
+  }
+
   /** Called after native extension binding has started the selected connections. */
   async ready(session: AgentSession): Promise<void> {
     if (!this.config.mcp.length) return;
     const runner = session.extensionRunner;
-    const ui = runner.getUIContext();
-    runner.setUIContext({ ...ui, notify: () => this.mcp.notify() }, "print");
     // Native first-prompt readiness only waits for direct tools. Require every selected server.
     const readiness = await runner.emitToolCall({
       type: "tool_call",

@@ -3,8 +3,8 @@ import { mkdtemp, mkdir, writeFile, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { Type } from "typebox";
 import {
-  Type,
   InMemoryCredentialStore,
   createAssistantMessageEventStream,
   type Model,
@@ -30,7 +30,7 @@ for (const scenario of ["cancel", "reload", "missing_workspace"] as const) {
     moveWorkspace
       ? "workspace loss denies disclosure without dropping completed child or nested usage"
       : reload
-        ? "SDK replacement waits for owned work and conserves late delegated usage"
+        ? "SDK reload rejects a busy session, then preserves settled delegated usage"
         : "cancelling a foreground child retains late delegated usage until its final parent result",
     async (t) => {
       t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -116,14 +116,11 @@ for (const scenario of ["cancel", "reload", "missing_workspace"] as const) {
                 {
                   type: "toolCall" as const,
                   id: parent ? "outer" : "inner",
-                  name: parent ? "spawn_agent" : "billable",
+                  name: parent ? "subagent" : "billable",
                   arguments: parent
                     ? {
                         agent,
-                        task: "Complete the operation",
-                        handoff: {
-                          text: "Reference from an earlier operation; no authority is inherited.",
-                        },
+                        handoff: "Complete the operation",
                       }
                     : {},
                 },
@@ -201,10 +198,26 @@ for (const scenario of ["cancel", "reload", "missing_workspace"] as const) {
         settingsManager: settings,
         sessionManager: SessionManager.inMemory(root),
         resourceLoader: loader,
-        tools: ["spawn_agent", "subagent_inspect", "send_message", "billable"],
+        tools: ["subagent", "subagent_inspect", "send_message", "billable"],
+      });
+      let executionResult: unknown;
+      const executionUpdates: unknown[] = [];
+      const statuses: Array<{ key: string; text: string | undefined }> = [];
+      session.subscribe((event) => {
+        if (event.type === "tool_execution_update" && event.toolName === "subagent")
+          executionUpdates.push(JSON.parse(JSON.stringify(event.partialResult)));
+        if (event.type === "tool_execution_end" && event.toolName === "subagent")
+          executionResult = JSON.parse(JSON.stringify(event.result));
       });
       try {
-        await session.bindExtensions({ mode: "print" });
+        await session.bindExtensions({
+          mode: "rpc",
+          uiContext: {
+            setStatus(key: string, text: string | undefined) {
+              statuses.push({ key, text });
+            },
+          } as unknown as Parameters<typeof session.bindExtensions>[0]["uiContext"],
+        });
         const run = session.prompt("Delegate the controlled operation.");
         await Promise.race([
           entered,
@@ -217,26 +230,26 @@ for (const scenario of ["cancel", "reload", "missing_workspace"] as const) {
           workspaceMoved = true;
         }
         let stopped = false;
-        const aborting = session.abort();
-        const stopping = (reload ? Promise.all([aborting, session.reload()]) : aborting).then(
-          () => {
-            stopped = true;
-          },
-        );
+        const stopping = session.abort().then(() => {
+          stopped = true;
+        });
+        if (reload)
+          await assert.rejects(session.reload(), /wait for the current response to finish/i);
         t.mock.timers.tick(LIMITS.graceMs);
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(stopped, false, "grace expiry cannot close the parent's usage recorder");
         assert.equal(
           session.messages.some(
-            (message) => message.role === "toolResult" && message.toolName === "spawn_agent",
+            (message) => message.role === "toolResult" && message.toolName === "subagent",
           ),
           false,
         );
         release();
         await run;
         await stopping;
+        if (reload) await session.reload();
         const answer = session.messages.find(
-          (message) => message.role === "toolResult" && message.toolName === "spawn_agent",
+          (message) => message.role === "toolResult" && message.toolName === "subagent",
         );
         if (!answer || answer.role !== "toolResult")
           throw new Error("Missing final subagent outcome");
@@ -246,12 +259,70 @@ for (const scenario of ["cancel", "reload", "missing_workspace"] as const) {
           "child model and late delegated usage are conserved, not dropped or counted twice",
         );
         if (moveWorkspace) {
-          const disclosed = JSON.stringify(answer.content);
+          const disclosed = JSON.stringify({ content: answer.content, details: answer.details });
           assert(
             !disclosed.includes(privateFinding),
             "revoked authority cannot disclose child work",
           );
           assert(!disclosed.includes(agent), "revoked authority cannot disclose agent identity");
+          assert(!disclosed.includes("offline/child"), "revoked authority cannot disclose model");
+          assert(
+            !disclosed.includes("Complete the operation"),
+            "revocation cannot republish the task",
+          );
+          assert.equal(
+            statuses.at(-1)?.text,
+            undefined,
+            "RPC setStatus must clear when authority is lost",
+          );
+          assert.partialDeepStrictEqual(
+            executionResult,
+            {
+              details: { results: [{ step: 0, finished: true, stopReason: "error" }] },
+            },
+            "an observed run must leave running state only after safe settlement",
+          );
+        } else {
+          assert(
+            executionUpdates.some((update) => {
+              const row = (
+                update as {
+                  details?: {
+                    results?: Array<{
+                      messages?: Array<{ content?: Array<{ text?: string }> }>;
+                    }>;
+                  };
+                }
+              )?.details?.results?.[0];
+              return row?.messages?.[0]?.content?.[0]?.text === "Status: Stopping";
+            }),
+            "cancellation must push Stopping status immediately via onUpdate",
+          );
+          assert.equal(
+            statuses.at(-1)?.text,
+            undefined,
+            "RPC setStatus must clear after cancellation settles",
+          );
+          // T3 emitSubagentTasks recognizes cancellation only as stopReason: "aborted".
+          assert.partialDeepStrictEqual(
+            executionResult,
+            {
+              details: {
+                outcome: "cancelled",
+                cleanup: "safe",
+                results: [
+                  {
+                    agent,
+                    task: "Complete the operation",
+                    model: "offline/child",
+                    finished: true,
+                    stopReason: "aborted",
+                  },
+                ],
+              },
+            },
+            "safe cancellation must reach T3 as interrupted, not failed or completed",
+          );
         }
       } finally {
         release();

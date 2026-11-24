@@ -1,10 +1,10 @@
 import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
 import { join } from "node:path";
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import { LIMITS } from "./limits.ts";
+import { LIMITS, resolveExecutionLimits, type ExecutionLimits } from "./limits.ts";
 
 /** One generation uses one user-owned capacity snapshot; project settings cannot override it. */
-export function loadSettings(): { maxConcurrentRuns: number } {
+export function loadSettings(): { maxConcurrentRuns: number; executionLimits: ExecutionLimits } {
   const path = join(getAgentDir(), "sub-agents.json");
   let source: string;
   try {
@@ -29,7 +29,10 @@ export function loadSettings(): { maxConcurrentRuns: number } {
     }
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT")
-      return { maxConcurrentRuns: LIMITS.runs };
+      return Object.freeze({
+        maxConcurrentRuns: LIMITS.runs,
+        executionLimits: resolveExecutionLimits(),
+      });
     throw new Error(`Cannot read subagent settings: ${path}`, { cause: error });
   }
   let settings: unknown;
@@ -40,8 +43,8 @@ export function loadSettings(): { maxConcurrentRuns: number } {
   }
   if (!settings || typeof settings !== "object" || Array.isArray(settings))
     throw new Error(`${path}: settings must be a JSON object.`);
-  if (Object.keys(settings).some((key) => key !== "maxConcurrentRuns"))
-    throw new Error(`${path}: only "maxConcurrentRuns" is supported.`);
+  if (Object.keys(settings).some((key) => key !== "maxConcurrentRuns" && key !== "executionLimits"))
+    throw new Error(`${path}: only "maxConcurrentRuns" and "executionLimits" are supported.`);
   const value = "maxConcurrentRuns" in settings ? settings.maxConcurrentRuns : LIMITS.runs;
   if (
     typeof value !== "number" ||
@@ -52,5 +55,10 @@ export function loadSettings(): { maxConcurrentRuns: number } {
     throw new Error(
       `${path}: "maxConcurrentRuns" must be an integer between 1 and ${LIMITS.retainedAgents}.`,
     );
-  return { maxConcurrentRuns: value };
+  return Object.freeze({
+    maxConcurrentRuns: value,
+    executionLimits: resolveExecutionLimits(
+      "executionLimits" in settings ? settings.executionLimits : undefined,
+    ),
+  });
 }

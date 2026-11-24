@@ -25,7 +25,6 @@ test("parent MCP and tool aggregators cannot grant a child unselected capabiliti
     "tool_search",
     "read_mcp_resource",
     "mcp_describe",
-    "spawn_agent",
     "list_agents",
     "interrupt_agent",
     "custom-router",

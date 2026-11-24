@@ -1,7 +1,6 @@
 export const LIMITS = Object.freeze({
-  runs: 3,
+  runs: 5,
   taskBytes: 64 * 1024,
-  handoffBytes: 16 * 1024,
   messageBytes: 8 * 1024,
   pendingMessages: 8,
   pendingMessageBytes: 32 * 1024,
@@ -31,6 +30,7 @@ export const LIMITS = Object.freeze({
   safeguardSummaryMs: 60 * 1000,
   safeguardTokens: 2048,
   wrapUpTurns: 2,
+  wrapUpMs: 2 * 60 * 1000,
   wrapUpModelTokenFraction: 0.1,
   tokens: 8192,
   // Per-request inbound wire/event work, independent of model context size.
@@ -49,6 +49,61 @@ export const LIMITS = Object.freeze({
   retained: 32,
   retentionMs: 60 * 60 * 1000,
 });
+
+export interface ExecutionLimits {
+  readonly invocationMs: number;
+  readonly toolMs: number;
+  readonly maxOutputTokens: number;
+}
+
+export const DEFAULT_EXECUTION_LIMITS: ExecutionLimits = Object.freeze({
+  invocationMs: LIMITS.invocationMs,
+  toolMs: LIMITS.toolMs,
+  maxOutputTokens: LIMITS.tokens,
+});
+
+/** Resolve only the user-owned configuration boundary, never task/model input. */
+export function resolveExecutionLimits(value: unknown = undefined): ExecutionLimits {
+  if (value === undefined) return DEFAULT_EXECUTION_LIMITS;
+  if (value === null || typeof value !== "object" || Array.isArray(value))
+    throw new Error('"executionLimits" must be an object.');
+  const allowed = Object.keys(DEFAULT_EXECUTION_LIMITS);
+  if (Object.keys(value).some((key) => !allowed.includes(key)))
+    throw new Error('Unsupported "executionLimits" field.');
+  const limits = { ...DEFAULT_EXECUTION_LIMITS, ...value };
+  for (const [key, limit] of Object.entries(limits))
+    if (
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      (key !== "maxOutputTokens" && limit > 2_147_483_647)
+    )
+      throw new Error(
+        `"executionLimits.${key}" must be a positive safe integer${key === "maxOutputTokens" ? "" : " no greater than 2147483647"}.`,
+      );
+  if (limits.toolMs > limits.invocationMs)
+    throw new Error('"executionLimits.toolMs" cannot exceed "invocationMs".');
+  return Object.freeze(limits);
+}
+
+export function modelExecutionLimits(
+  limits: ExecutionLimits,
+  model: { maxTokens: number },
+): ExecutionLimits {
+  return Object.freeze({
+    ...limits,
+    maxOutputTokens: modelOutputTokens(limits.maxOutputTokens, model),
+  });
+}
+
+/** Validate after applying model metadata, which the SDK does not require to be integral. */
+export function modelOutputTokens(requested: number, model: { maxTokens: number }): number {
+  const limit = model.maxTokens > 0 ? Math.min(requested, model.maxTokens) : requested;
+  if (!Number.isSafeInteger(limit) || limit <= 0)
+    throw new Error(
+      "Effective model output limit must be a positive safe integer; check the selected model's maxTokens.",
+    );
+  return limit;
+}
 
 const textEncoder = new TextEncoder();
 

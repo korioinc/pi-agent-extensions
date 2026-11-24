@@ -1,6 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { homedir } from "node:os";
 import {
+  McpHttpError,
+  McpSessionExpiredError,
   StdioTransport,
   StreamableHttpTransport,
   type McpFetch,
@@ -12,16 +14,40 @@ import { HttpResponseResources } from "../http-resources.ts";
 
 const failed = () => new Error("MCP transport operation failed.");
 
+/** Retain SDK recovery signals without retaining response bodies, headers, causes or raw messages. */
+function operationError(error: unknown): Error {
+  if (error instanceof McpSessionExpiredError) return new McpSessionExpiredError();
+  if (error instanceof McpHttpError) return new McpHttpError(error.status, failed().message);
+  if (error instanceof TypeError) return new TypeError(failed().message);
+  return failed();
+}
+
 /** Patch the instance too: SDK-internal close calls must join the first close, even after rejection. */
-export function ownMcpTransport(transport: McpTransport): McpTransport {
+export function ownMcpTransport(
+  transport: McpTransport,
+  onUnsafe: () => void = () => {},
+): McpTransport {
   const close = transport.close.bind(transport);
   let closing: Promise<void> | undefined;
-  transport.close = () => (closing ??= Promise.resolve().then(close));
+  transport.close = () =>
+    (closing ??= Promise.resolve()
+      .then(close)
+      .catch((error) => {
+        onUnsafe();
+        throw error;
+      }));
   return transport;
 }
 
-async function settleClose(operations: Promise<unknown>[]): Promise<void> {
-  const results = await Promise.allSettled(operations);
+async function settleClose(operations: Promise<unknown>[], onUnsafe: () => void): Promise<void> {
+  const results = await Promise.allSettled(
+    operations.map((operation) =>
+      operation.catch((error) => {
+        onUnsafe();
+        throw error;
+      }),
+    ),
+  );
   const errors = results.filter((result) => result.status === "rejected").map(() => failed());
   if (errors.length) throw new AggregateError(errors, "MCP transport cleanup failed.");
 }
@@ -30,17 +56,32 @@ async function settleClose(operations: Promise<unknown>[]): Promise<void> {
 class McpHttp {
   readonly controller = new AbortController();
   readonly requestSignal = new AsyncLocalStorage<AbortSignal | undefined>();
-  private readonly resources = new HttpResponseResources(failed);
+  private readonly resources: HttpResponseResources;
   private streamTrafficBytes = 0;
 
   private readonly endpoint: URL;
   private readonly signal: AbortSignal;
   private readonly request: McpFetch;
 
-  constructor(endpoint: URL, signal: AbortSignal, request: McpFetch) {
+  constructor(endpoint: URL, signal: AbortSignal, request: McpFetch, onUnsafe: () => void) {
     this.endpoint = endpoint;
     this.signal = signal;
     this.request = request;
+    this.resources = new HttpResponseResources(
+      (error, kind) => (kind === "operation" ? this.redact(error) : failed()),
+      () => {
+        this.controller.abort();
+        onUnsafe();
+      },
+    );
+  }
+
+  redact(error: unknown): Error {
+    return this.signal.aborted ||
+      this.controller.signal.aborted ||
+      this.requestSignal.getStore()?.aborted
+      ? failed()
+      : operationError(error);
   }
 
   readonly fetch: McpFetch = (input, init) =>
@@ -53,13 +94,17 @@ class McpHttp {
     try {
       const url = new URL(input.toString());
       if (url.href !== this.endpoint.href) throw failed();
-      const signals = [
-        this.signal,
-        this.controller.signal,
-        init?.signal,
-        this.requestSignal.getStore(),
-      ];
-      const signal = AbortSignal.any(signals.filter((item): item is AbortSignal => item != null));
+    } catch {
+      throw failed();
+    }
+    const signals = [
+      this.signal,
+      this.controller.signal,
+      init?.signal,
+      this.requestSignal.getStore(),
+    ];
+    const signal = AbortSignal.any(signals.filter((item): item is AbortSignal => item != null));
+    try {
       signal.throwIfAborted();
       const response = await this.request(input, { ...init, redirect: "error", signal });
       const eventStream =
@@ -79,7 +124,12 @@ class McpHttp {
             } else {
               // SDK response.json()/text() otherwise buffer the entire JSON or error body.
               bytes += chunkBytes;
-              if (bytes > LIMITS.mcpHttpBodyBytes) throw failed();
+              if (bytes > LIMITS.mcpHttpBodyBytes) {
+                // The SDK can replace a body-read failure with its HTTP status error.
+                // Seal the owner so a transient status cannot retry this policy failure.
+                this.controller.abort();
+                throw failed();
+              }
             }
           })
         : null;
@@ -93,8 +143,8 @@ class McpHttp {
         throw failed();
       }
       return new Response(body, { status: response.status, headers: response.headers });
-    } catch {
-      throw failed();
+    } catch (error) {
+      throw signal.aborted ? failed() : this.redact(error);
     }
   }
 
@@ -104,7 +154,11 @@ class McpHttp {
   }
 }
 
-export function createMcpTransport(server: McpServer, signal: AbortSignal): McpTransport {
+export function createMcpTransport(
+  server: McpServer,
+  signal: AbortSignal,
+  onUnsafe: () => void = () => {},
+): McpTransport {
   const config = server.transport;
   let resources: McpHttp | undefined;
   let transport: McpTransport;
@@ -137,7 +191,7 @@ export function createMcpTransport(server: McpServer, signal: AbortSignal): McpT
     } catch {
       throw failed();
     }
-    resources = new McpHttp(endpoint, signal, globalThis.fetch);
+    resources = new McpHttp(endpoint, signal, globalThis.fetch, onUnsafe);
     transport = new StreamableHttpTransport({
       url: endpoint.href,
       headers: config.headers,
@@ -147,24 +201,44 @@ export function createMcpTransport(server: McpServer, signal: AbortSignal): McpT
     const ownedResources = resources;
     // Abort local I/O before SDK close. Its best-effort DELETE may be skipped; this is
     // transport resource closure, not a promise to roll back the remote session.
-    transport.close = () => settleClose([ownedResources.close(), Promise.resolve().then(close)]);
+    transport.close = () =>
+      settleClose([ownedResources.close(), Promise.resolve().then(close)], onUnsafe);
   }
-  ownMcpTransport(transport);
-  const redact = async (operation: () => Promise<void>) => {
+  ownMcpTransport(transport, onUnsafe);
+  const redact = async (
+    operation: () => Promise<void>,
+    requestSignal?: AbortSignal,
+    method?: string,
+  ) => {
     try {
       signal.throwIfAborted();
       await operation();
-    } catch {
-      throw failed();
+    } catch (error) {
+      const redacted = requestSignal?.aborted ? failed() : (resources?.redact(error) ?? failed());
+      // Pi may load a different pi-mcp instance, so its instanceof McpHttpError can fail.
+      // Its initialization retry also accepts built-in TypeError. Match only that SDK
+      // transient-status policy here; ordinary tool POSTs must never gain a retry.
+      if (
+        method === "initialize" &&
+        redacted instanceof McpHttpError &&
+        (redacted.status === 408 ||
+          redacted.status === 429 ||
+          (redacted.status >= 500 && redacted.status <= 599 && redacted.status !== 501))
+      )
+        throw new TypeError(redacted.message);
+      throw redacted;
     }
   };
   return {
     start: () => redact(() => transport.start()),
     send: (message, options) =>
-      redact(() =>
-        resources
-          ? resources.requestSignal.run(options?.signal, () => transport.send(message, options))
-          : transport.send(message, options),
+      redact(
+        () =>
+          resources
+            ? resources.requestSignal.run(options?.signal, () => transport.send(message, options))
+            : transport.send(message, options),
+        options?.signal,
+        "method" in message ? message.method : undefined,
       ),
     close: transport.close,
     onMessage: (listener) => transport.onMessage(listener),

@@ -9,6 +9,7 @@ type PendingOutput = { type: "replace" } | { type: "append"; chunks: string[] };
 interface ResponseEvidence {
   text: string;
   failure?: string;
+  publicationFailure?: string;
   stopReason?: AssistantMessage["stopReason"];
   toolCall: boolean;
 }
@@ -36,6 +37,7 @@ export class AssistantOutput {
 
   get error(): string | undefined {
     return (
+      this.retained.publicationFailure ??
       this.retained.failure ??
       (this.retained.stopReason === "length"
         ? "Model output limit reached (length); the answer is incomplete."
@@ -57,9 +59,10 @@ export class AssistantOutput {
       evidence.stopReason = event.message.stopReason;
       if (this.candidate)
         evidence.toolCall ||= event.message.content.some((block) => block.type === "toolCall");
-      if (event.message.stopReason === "error" || event.message.stopReason === "aborted")
-        evidence.failure ??=
-          event.message.errorMessage ?? `Model stopped: ${event.message.stopReason}`;
+      evidence.failure =
+        event.message.stopReason === "error" || event.message.stopReason === "aborted"
+          ? (event.message.errorMessage ?? `Model stopped: ${event.message.stopReason}`)
+          : undefined;
     } else {
       const update = event.assistantMessageEvent;
       if (
@@ -92,6 +95,7 @@ export class AssistantOutput {
         this.closed ||
         !accept() ||
         candidate.failure ||
+        candidate.publicationFailure ||
         candidate.stopReason !== "stop" ||
         candidate.toolCall ||
         !candidate.text.trim()
@@ -99,7 +103,7 @@ export class AssistantOutput {
         return false;
       // Publish before committing so a failed publisher cannot erase retained evidence.
       this.publish({ type: "replace", text: candidate.text });
-      this.retained = candidate;
+      this.retained = { ...candidate, publicationFailure: this.retained.publicationFailure };
       return true;
     } finally {
       // Flush while still private, then discard reconciliation state and candidate text.
@@ -225,7 +229,7 @@ export class AssistantOutput {
       }
     } catch {
       // Presentation runs from a timer as well as SDK callbacks; never throw out of the timer.
-      (this.candidate ?? this.retained).failure ??= "Child output publication failed.";
+      (this.candidate ?? this.retained).publicationFailure ??= "Child output publication failed.";
     }
   }
 }

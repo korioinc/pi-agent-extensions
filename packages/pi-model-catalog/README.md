@@ -19,7 +19,7 @@ npm ci
 npx pi -e ./packages/pi-model-catalog/index.ts
 ```
 
-Requires Pi 1.4.0 or later.
+Requires stable Pi 1.6.0 or later.
 
 ## Minimal configuration
 

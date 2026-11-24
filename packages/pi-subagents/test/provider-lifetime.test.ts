@@ -8,9 +8,13 @@ import {
   createAssistantMessageEventStream,
   normalizeContext,
   type AssistantMessage,
+  type Model,
 } from "@earendil-works/pi-ai";
+import { streamSimple as streamGoogleGenerativeAI } from "@earendil-works/pi-ai/api/google-generative-ai";
+import { streamSimple as streamOpenAIResponses } from "@earendil-works/pi-ai/api/openai-responses";
 import { ParentProvider } from "../src/session/provider.ts";
 import type { ResearchConfig } from "../src/runtime/index.ts";
+import { DEFAULT_EXECUTION_LIMITS, modelExecutionLimits } from "../src/runtime/limits.ts";
 
 const model: ResearchConfig["model"] = {
   api: "openai-completions",
@@ -53,6 +57,75 @@ function answer(): AssistantMessage {
   };
 }
 
+test("preparation rejects a fractional effective model output allowance", () => {
+  assert.throws(() => modelExecutionLimits(DEFAULT_EXECUTION_LIMITS, { maxTokens: 0.75 }));
+});
+
+for (const summary of [false, true]) {
+  for (const maxTokens of [0.75, 1024.5, 1024]) {
+    const admitted = maxTokens === 1024;
+    test(`${summary ? "summary" : "ordinary"} request ${admitted ? "accepts an integer" : "rejects a fractional"} model output ceiling of ${maxTokens}`, async (t) => {
+      const selected: Model<"openai-responses"> = {
+        ...model,
+        api: "openai-responses",
+        provider: "openai",
+        maxTokens,
+      };
+      let dispatched = false;
+      t.mock.method(
+        globalThis,
+        "fetch",
+        async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+          dispatched = true;
+          const request = JSON.parse(String(init?.body));
+          assert.ok(Number.isSafeInteger(request.max_output_tokens));
+          assert.ok(request.max_output_tokens > 0 && request.max_output_tokens <= maxTokens);
+          return new Response(
+            `data: ${JSON.stringify({
+              type: "response.completed",
+              response: { id: "resp_offline", status: "completed", output: [] },
+            })}\n\n`,
+            { headers: { "content-type": "text/event-stream" } },
+          );
+        },
+      );
+      const owner = new ParentProvider(
+        {
+          executionLimits: DEFAULT_EXECUTION_LIMITS,
+          model: selected,
+          thinkingLevel: "off",
+          stream: (_model, context, options) =>
+            streamOpenAIResponses(selected, normalizeContext(context), {
+              ...options,
+              apiKey: "offline-not-a-credential",
+            }),
+        },
+        {
+          signal: new AbortController().signal,
+          summary: () => summary,
+          check() {},
+          cleanupUnsafe() {},
+          request: () => ({
+            requestIndex: 1,
+            remainingMs: DEFAULT_EXECUTION_LIMITS.invocationMs - 0.25,
+          }),
+          trackTransport() {},
+          exceeded(limit) {
+            throw new Error(limit);
+          },
+        },
+        "child-output-limit",
+      );
+      t.after(() => owner.close());
+      const result = await owner.provider
+        .streamSimple(selected, normalizeContext({ messages: [] }))
+        .result();
+      assert.equal(dispatched, admitted, "fractional allowances must fail before model dispatch");
+      assert.equal(result.stopReason, admitted ? "stop" : "error");
+    });
+  }
+}
+
 for (const rejectClose of [false, true]) {
   test(`provider ownership waits for late acquisition and ${rejectClose ? "retains failed" : "awaits"} cleanup`, async (t) => {
     const acquired = gate();
@@ -75,8 +148,10 @@ for (const rejectClose of [false, true]) {
       );
     });
     let dispatched = 0;
+    let requestIndex = 0;
     const owner = new ParentProvider(
       {
+        executionLimits: DEFAULT_EXECUTION_LIMITS,
         model,
         thinkingLevel: "off",
         stream(_model, _context, options) {
@@ -94,7 +169,11 @@ for (const rejectClose of [false, true]) {
       {
         signal: new AbortController().signal,
         check() {},
-        request() {},
+        cleanupUnsafe() {},
+        request: () => ({
+          requestIndex: ++requestIndex,
+          remainingMs: DEFAULT_EXECUTION_LIMITS.invocationMs,
+        }),
         trackTransport() {},
         exceeded(limit) {
           throw new Error(limit);
@@ -143,8 +222,10 @@ test("consumer-handled cancellation failure cannot permit later provider effects
       ),
   );
   let initial = true;
+  let requestIndex = 0;
   const owner = new ParentProvider(
     {
+      executionLimits: DEFAULT_EXECUTION_LIMITS,
       model,
       thinkingLevel: "off",
       stream(_model, _context, options) {
@@ -167,7 +248,11 @@ test("consumer-handled cancellation failure cannot permit later provider effects
     {
       signal: new AbortController().signal,
       check() {},
-      request() {},
+      cleanupUnsafe() {},
+      request: () => ({
+        requestIndex: ++requestIndex,
+        remainingMs: DEFAULT_EXECUTION_LIMITS.invocationMs,
+      }),
       trackTransport() {},
       exceeded(limit) {
         throw new Error(limit);
@@ -183,4 +268,132 @@ test("consumer-handled cancellation failure cannot permit later provider effects
   assert.equal(await readFile(effect, "utf8"), "unchanged");
   await assert.rejects(owner.close());
   await assert.rejects(owner.close());
+});
+
+for (const api of ["google-generative-ai", "google-vertex"] as const) {
+  test(`${api} receives owned fetch wrapper for httpStatus observation and wire bounds`, async (t) => {
+    const selected: ResearchConfig["model"] = { ...model, api, provider: "google" };
+    let fetched = false;
+    t.mock.method(globalThis, "fetch", async () => {
+      fetched = true;
+      return new Response("Unauthorized", { status: 401 });
+    });
+    let requestIndex = 0;
+    let fastChecks = 0;
+    let fullChecks = 0;
+    const owner = new ParentProvider(
+      {
+        executionLimits: DEFAULT_EXECUTION_LIMITS,
+        model: selected,
+        thinkingLevel: "off",
+        stream(_model, _context, options) {
+          const source = createAssistantMessageEventStream();
+          void (async () => {
+            assert.equal(typeof options?.fetch, "function", `${api} must receive wrapped fetch`);
+            await options!.fetch!("https://unused.invalid");
+            await options?.onProviderStreamEvent?.({ type: "delta" }, selected);
+            const message: AssistantMessage = {
+              ...answer(),
+              api,
+              stopReason: "error",
+              errorMessage: "HTTP 401",
+            };
+            source.push({ type: "error", reason: "error", error: message });
+            source.end();
+          })();
+          return source;
+        },
+      },
+      {
+        signal: new AbortController().signal,
+        check() {
+          fullChecks++;
+        },
+        checkFast() {
+          fastChecks++;
+        },
+        cleanupUnsafe() {},
+        request: () => ({
+          requestIndex: ++requestIndex,
+          remainingMs: DEFAULT_EXECUTION_LIMITS.invocationMs,
+        }),
+        trackTransport() {},
+        exceeded(limit) {
+          throw new Error(limit);
+        },
+      },
+      "child-google",
+    );
+    t.after(() => owner.close());
+    const result = await owner.provider
+      .streamSimple(selected, normalizeContext({ messages: [] }))
+      .result();
+    assert.equal(fetched, true);
+    assert.equal(owner.evidence(result)?.httpStatus, 401);
+    assert.equal(fullChecks, 1, "dispatch must run full authority check");
+    assert.equal(fastChecks, 1, "stream events must use hot-path checkFast");
+  });
+}
+
+test("real google-generative-ai adapter uses ParentProvider wrapped fetch and records HTTP status", async (t) => {
+  const selected: Model<"google-generative-ai"> = {
+    api: "google-generative-ai",
+    provider: "google",
+    id: "gemini-2.5-flash",
+    name: "Gemini 2.5 Flash",
+    baseUrl: "https://generativelanguage.googleapis.com/v1beta",
+    reasoning: false,
+    input: ["text"],
+    contextWindow: 100000,
+    maxTokens: 8192,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  };
+  let fetchCalls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    fetchCalls++;
+    return new Response(
+      JSON.stringify({ error: { code: 401, message: "Invalid key", status: "UNAUTHENTICATED" } }),
+      { status: 401, headers: { "content-type": "application/json" } },
+    );
+  });
+  let requestIndex = 0;
+  const owner = new ParentProvider(
+    {
+      executionLimits: DEFAULT_EXECUTION_LIMITS,
+      model: selected,
+      thinkingLevel: "off",
+      stream: (_model, context, options) =>
+        streamGoogleGenerativeAI(selected, normalizeContext(context), {
+          ...options,
+          apiKey: "offline-not-a-credential",
+        }),
+    },
+    {
+      signal: new AbortController().signal,
+      check() {},
+      checkFast() {},
+      cleanupUnsafe() {},
+      request: () => ({
+        requestIndex: ++requestIndex,
+        remainingMs: DEFAULT_EXECUTION_LIMITS.invocationMs,
+      }),
+      trackTransport() {},
+      exceeded(limit) {
+        throw new Error(limit);
+      },
+    },
+    "child-google-real",
+  );
+  t.after(() => owner.close());
+  const result = await owner.provider
+    .streamSimple(
+      selected,
+      normalizeContext({
+        messages: [{ role: "user", content: "Check status", timestamp: Date.now() }],
+      }),
+    )
+    .result();
+  assert.equal(fetchCalls, 1);
+  assert.equal(result.stopReason, "error");
+  assert.equal(owner.evidence(result)?.httpStatus, 401);
 });

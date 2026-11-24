@@ -8,9 +8,9 @@ import {
   type AutocompleteItem,
   type AutocompleteProvider,
 } from "@earendil-works/pi-tui";
-import { stripVTControlCharacters } from "node:util";
 import { boundedText, LIMITS } from "../runtime/limits.ts";
 import { AgentCatalog } from "./catalog.ts";
+import { clean } from "./sanitize.ts";
 
 type CatalogResult = Awaited<ReturnType<AgentCatalog["list"]>> | { rejection: "not_available" };
 type ListAgents = (ctx: ExtensionContext, signal?: AbortSignal) => Promise<CatalogResult>;
@@ -133,9 +133,7 @@ export function registerAgentMentions(pi: ExtensionAPI, list: ListAgents) {
             agent.model ??
             (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "No model selected");
           const thinking = agent.thinkingLevel ?? ctx.thinkingLevel ?? "off";
-          const metadata = stripVTControlCharacters(
-            boundedText(`${model} · ${thinking}`, 240),
-          ).replace(/[\r\n\t]/g, " ");
+          const metadata = boundedText(clean(`${model} · ${thinking}`), 240);
           return {
             label: ctx.ui.theme.fg("success", `@${agent.name}`),
             description: ctx.ui.theme.fg("success", `Subagent · ${metadata}`),
@@ -190,10 +188,8 @@ export function registerAgentMentions(pi: ExtensionAPI, list: ListAgents) {
         return fail("This agent is unavailable. Check its definition with list_agents.");
       }
       if (!match[2]?.trim()) return fail("Usage: @agent-name task description");
-      if (!pi.getActiveTools().includes("spawn_agent"))
-        return fail(
-          "The spawn_agent tool is inactive. Activate it, then enter your request again.",
-        );
+      if (!pi.getActiveTools().includes("subagent"))
+        return fail("The subagent tool is inactive. Activate it, then enter your request again.");
       const skillPrefix =
         text === event.text ? "" : event.text.slice(0, event.text.lastIndexOf(text));
       const task = skillPrefix + match[2].trim();
@@ -202,8 +198,8 @@ export function registerAgentMentions(pi: ExtensionAPI, list: ListAgents) {
       return {
         action: "transform" as const,
         text:
-          "The user requests delegation to the named subagent. Call the existing spawn_agent tool with the following JSON arguments; do not perform the task in the parent instead. Report tool failure rather than claiming the child ran. Do not automatically replay an accepted run. This is a parent-model delegation request, not evidence of execution.\n" +
-          JSON.stringify({ agent: match[1], task }),
+          "The user requests delegation to the named subagent. Call the existing subagent tool with the following JSON arguments; do not perform the task in the parent instead. Report tool failure rather than claiming the child ran. Do not automatically replay an accepted run. This is a parent-model delegation request, not evidence of execution.\n" +
+          JSON.stringify({ agent: match[1], handoff: task }),
         images: event.images,
       };
     } catch {

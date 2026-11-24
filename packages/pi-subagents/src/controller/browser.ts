@@ -3,13 +3,13 @@ import {
   Input,
   fuzzyFilter,
   getKeybindings,
-  stripTerminalSequences,
   truncateToWidth,
   wrapTextWithAnsi,
   type Component,
   type Focusable,
 } from "@earendil-works/pi-tui";
 import type { AgentCatalog } from "./catalog.ts";
+import { clean } from "./sanitize.ts";
 
 type CatalogView = Awaited<ReturnType<AgentCatalog["list"]>> | { rejection: "not_available" };
 type Catalog = Extract<CatalogView, { agents: unknown }>;
@@ -24,11 +24,6 @@ type Options = {
   parentModel?: string;
   parentThinking?: string;
 };
-export const clean = (text: string) =>
-  stripTerminalSequences(text).replace(
-    /[\p{Cc}\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/gu,
-    " ",
-  );
 
 /** Inspect definitions with Pi-style inline search; invocation belongs to @ autocomplete. */
 export class SubagentsBrowser implements Component, Focusable {

@@ -14,6 +14,7 @@ import type { ResearchHost } from "../src/runtime/index.ts";
 import { inspectWorkspace } from "../src/workspace/identity.ts";
 import { runResearch } from "../src/runner/index.ts";
 import { RunnerPool } from "../src/runner-pool/index.ts";
+import { LIMITS } from "../src/runtime/limits.ts";
 
 // A local protocol fixture, not a user's MCP process or remote service.
 const SERVER = `
@@ -30,8 +31,9 @@ createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line)
 }).on('close',()=>{appendFileSync(file,label+':closed\\n');process.exit(0)});
 `;
 
-for (const [exposure, failure, withContinuation = true] of [
+for (const [exposure, failure, withContinuation = true, fanout = false] of [
   ["codemode", "none"],
+  ["codemode", "none", true, true],
   ["deferred", "none"],
   ["direct", "none"],
   ["codemode", "connection"],
@@ -45,7 +47,7 @@ for (const [exposure, failure, withContinuation = true] of [
       ? `an invalid selected skill body cannot start an external MCP server ${withContinuation ? "with" : "without"} continuation`
       : failStartup
         ? "partial MCP startup failure closes acquired servers without prompting"
-        : `child ${exposure} MCP calls only its selected server and closes it before completion`,
+        : `child ${exposure}${fanout ? " fanout" : ""} MCP calls only its selected server and closes it before completion`,
     async (t) => {
       const root = await mkdtemp(join(tmpdir(), "pi-child-mcp-"));
       const previous = process.env.PI_CODING_AGENT_DIR;
@@ -123,8 +125,16 @@ for (const [exposure, failure, withContinuation = true] of [
         stream(requested) {
           const stream = createAssistantMessageEventStream();
           const index = turn++;
-          const actions =
-            exposure === "direct"
+          const actions = fanout
+            ? [
+                {
+                  name: "codemode",
+                  arguments: {
+                    code: `await Promise.all(Array.from({length: ${LIMITS.toolConcurrency + 1}}, (_, i) => tools.mcp__selected__commit({value: "authorized-" + i})));`,
+                  },
+                },
+              ]
+            : exposure === "direct"
               ? [{ name: "mcp__selected__commit", arguments: { value: "authorized" } }]
               : [
                   {
@@ -221,6 +231,23 @@ for (const [exposure, failure, withContinuation = true] of [
           await readFile(file, "utf8"),
           "selected:start\nselected:closed\n",
           "earlier acquisitions must close without effects",
+        );
+        await pool.drain();
+        return;
+      }
+      if (fanout) {
+        const committed = (await readFile(file, "utf8")).trim().split("\n").sort();
+        assert.deepEqual(
+          committed,
+          [
+            "selected:start",
+            "selected:closed",
+            ...Array.from(
+              { length: LIMITS.toolConcurrency + 1 },
+              (_, i) => `selected:commit:authorized-${i}`,
+            ),
+          ].sort(),
+          "native Promise.all must commit every authorized operation and close its process",
         );
         await pool.drain();
         return;

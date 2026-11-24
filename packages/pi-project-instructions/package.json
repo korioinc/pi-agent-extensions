@@ -1,0 +1,60 @@
+{
+  "name": "@korioinc/pi-project-instructions",
+  "version": "0.1.0",
+  "description": "Add AGENTS.project.md from the trusted working directory to the Pi system prompt",
+  "keywords": [
+    "agents",
+    "instructions",
+    "pi",
+    "pi-package"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/korioinc/pi-agent-extensions.git",
+    "directory": "packages/pi-project-instructions"
+  },
+  "files": [
+    "index.ts",
+    "approvals.ts",
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "build:sdk": "tsc -p tsconfig.sdk.json",
+    "prepack": "npm run check && npm run build:sdk"
+  },
+  "dependencies": {
+    "jsonc-parser": "3.3.1",
+    "proper-lockfile": "4.1.2",
+    "semver": "7.8.5"
+  },
+  "devDependencies": {
+    "@types/proper-lockfile": "4.1.4"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=1.6.0"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
